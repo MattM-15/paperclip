@@ -303,13 +303,15 @@ function CompactTarget({
   const target = interaction.payload.target;
   const label = targetLabel(interaction);
   if (!target || !label) return null;
-  const href = target.href
-    ? normalizeRequestConfirmationTargetHref(target.href)
-    : null;
+  const href = target.type === "issue_attachment"
+    ? `/api/attachments/${encodeURIComponent(target.attachmentId)}/content`
+    : target.href ? normalizeRequestConfirmationTargetHref(target.href) : null;
   if (href) {
     return (
       <a
         href={href}
+        target={target.type === "issue_attachment" ? "_blank" : undefined}
+        rel={target.type === "issue_attachment" ? "noreferrer" : undefined}
         className="inline-flex rounded-sm border border-border px-2 py-0.5 font-mono text-xs text-foreground hover:bg-muted/60"
       >
         {label}

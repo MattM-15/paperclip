@@ -1541,10 +1541,10 @@ function requestConfirmationTargetHref({
   if (target.type === "issue_document" && target.revisionId) {
     return `/issues/${target.issueId ?? interaction.issueId}${buildDocumentAnnotationHash({ documentKey: target.key, revisionId: target.revisionId, interactionId: interaction.id, threadId: null, commentId: null })}`;
   }
-  if (target.href) return target.href;
   if (target.type === "issue_attachment") {
-    return `/issues/${target.issueId ?? interaction.issueId}#interaction-${interaction.id}&attachment=${encodeURIComponent(target.attachmentId)}`;
+    return `/api/attachments/${encodeURIComponent(target.attachmentId)}/content`;
   }
+  if (target.href) return target.href;
   if (target.type === "issue_document") {
     const issueId = target.issueId ?? interaction.issueId;
     return `/issues/${issueId}#document-${encodeURIComponent(target.key)}`;
@@ -1579,7 +1579,7 @@ function RequestConfirmationTargetChip({
   );
 
   if (!href) return <span className={className}>{content}</span>;
-  if (/^https?:\/\//i.test(href)) {
+  if (target.type === "issue_attachment" || /^https?:\/\//i.test(href)) {
     return (
       <a href={href} target="_blank" rel="noreferrer" className={className}>
         {content}

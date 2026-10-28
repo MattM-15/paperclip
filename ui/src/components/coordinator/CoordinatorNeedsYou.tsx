@@ -10,6 +10,7 @@ import { projectsApi } from "@/api/projects";
 import { useCompany } from "@/context/CompanyContext";
 import { useBreadcrumbs } from "@/context/BreadcrumbContext";
 import { usePanel } from "@/context/PanelContext";
+import { useSidebar } from "@/context/SidebarContext";
 import { useCoordinatorWorkspaceEnabled } from "@/hooks/useCoordinatorWorkspaceEnabled";
 import { useNavigate } from "@/lib/router";
 import { queryKeys } from "@/lib/queryKeys";
@@ -23,6 +24,7 @@ import { SidePanelTab } from "@/components/side-panel";
 import { ToolbarSearch } from "@/components/ToolbarSearch";
 import { Button } from "@/components/ui/button";
 import { NativeSelect } from "@/components/ui/select";
+import { Sheet, SheetContent, SheetHeader, SheetTitle } from "@/components/ui/sheet";
 import { parseCssTimeMs } from "@/components/task-chat/motion-tokens";
 import { readIssueReviewPolicyMetadata } from "@/lib/review-policy";
 import { CoordinatorDecisionReceipt as Receipt } from "./CoordinatorDecisionReceipt";
@@ -30,7 +32,7 @@ import { CoordinatorTaskMotion } from "./CoordinatorTaskCommitment";
 
 type Group = "none" | "task" | "agent" | "project";
 
-function HistoryPanel({ companyId, agents, onClose }: { companyId: string; agents: Agent[]; onClose: () => void }) {
+function HistoryPanel({ companyId, agents, onClose, mobile = false }: { companyId: string; agents: Agent[]; onClose: () => void; mobile?: boolean }) {
   const navigate = useNavigate();
   const [search, setSearch] = useState("");
   const [outcome, setOutcome] = useState("");
@@ -54,8 +56,7 @@ function HistoryPanel({ companyId, agents, onClose }: { companyId: string; agent
   const slot = typeof document !== "undefined" ? document.getElementById(PROPERTIES_PANE_HEADER_SLOT_ID) : null;
   const tab = <SidePanelTab id="decision-history" label="Decision history" active onSelect={() => {}} onClose={onClose} />;
   return <div className="space-y-5" data-coordinator-decision-history>
-    {slot ? createPortal(tab, slot) : tab}
-    <h2 className="text-lg font-medium">Decision history</h2>
+    {!mobile ? <>{slot ? createPortal(tab, slot) : tab}<h2 className="text-lg font-medium">Decision history</h2></> : null}
     <ToolbarSearch query={search} onQueryChange={setSearch} label="Search decision history" placeholder="Search decisions or task IDs…" />
     <div className="grid grid-cols-2 gap-2">
       <NativeSelect aria-label="Filter decision outcomes" value={outcome} onChange={(event) => setOutcome(event.target.value)}>
@@ -79,6 +80,7 @@ export function CoordinatorNeedsYou() {
   const { userId } = useCoordinatorWorkspaceEnabled();
   const { setBreadcrumbs } = useBreadcrumbs();
   const { openPanel, closePanel, setPanelVisible } = usePanel();
+  const { isMobile } = useSidebar();
   const navigate = useNavigate();
   const reducedMotion = useReducedMotion();
   const [query, setQuery] = useState("");
@@ -147,16 +149,17 @@ export function CoordinatorNeedsYou() {
   ]).entries()], [pendingItems, recentItems]);
   const filtersActive = Boolean(query.trim() || agentFilter || projectFilter);
   const closeHistory = useCallback(() => { setHistoryOpen(false); closePanel(); }, [closePanel]);
-  const showHistory = () => { setHistoryOpen(true); setPanelVisible(true); };
+  const showHistory = () => setHistoryOpen(true);
   useEffect(() => { setBreadcrumbs([{ label: "Needs You" }]); }, [setBreadcrumbs]);
   useEffect(() => {
     setSettling([]); setHistoryOpen(false); setNow(Date.now()); closePanel();
     return closePanel;
   }, [selectedCompanyId, closePanel]);
   useEffect(() => {
-    if (!historyOpen || !selectedCompanyId) { closePanel(); return; }
+    if (!historyOpen || !selectedCompanyId || isMobile) { closePanel(); return; }
+    setPanelVisible(true);
     openPanel(<HistoryPanel companyId={selectedCompanyId} agents={agentQuery.data ?? []} onClose={closeHistory} />);
-  }, [historyOpen, selectedCompanyId, agentQuery.data, openPanel, closePanel, closeHistory]);
+  }, [historyOpen, selectedCompanyId, isMobile, agentQuery.data, openPanel, closePanel, closeHistory, setPanelVisible]);
   useEffect(() => {
     const next = recentItems.reduce((earliest, item) => Math.min(earliest, Date.parse(item.resolvedAt) + COORDINATOR_RECENT_DECISION_MS), Infinity);
     if (!Number.isFinite(next)) return;
@@ -175,6 +178,12 @@ export function CoordinatorNeedsYou() {
   const duration = typeof document === "undefined" ? 0 : parseCssTimeMs(getComputedStyle(document.documentElement).getPropertyValue("--motion-duration-base")) / 1_000;
   if (!selectedCompanyId) return <p className="text-sm text-muted-foreground">Choose a company to see its decisions.</p>;
   return <LayoutGroup id="coordinator-decisions"><section className="coordinator-needs-you mx-auto w-full max-w-4xl space-y-6" aria-label="Needs You">
+    {isMobile ? <Sheet open={historyOpen} onOpenChange={open => { if (!open) closeHistory(); }}>
+      <SheetContent side="bottom" aria-describedby={undefined} className="mobile-task-side-panel inset-0 h-dvh max-h-dvh w-full max-w-none gap-0 border-0 p-0 pt-(--sz-safe-top) pb-(--sz-safe-bottom)">
+        <SheetHeader><SheetTitle>Decision history</SheetTitle></SheetHeader>
+        <div className="min-h-0 flex-1 overflow-y-auto p-4"><HistoryPanel companyId={selectedCompanyId} agents={agentQuery.data ?? []} onClose={closeHistory} mobile /></div>
+      </SheetContent>
+    </Sheet> : null}
     <header className="flex items-center justify-between gap-3"><h1 className="text-2xl font-medium">Needs You</h1><Button variant="ghost" onClick={showHistory}><History className="size-4" />Decision history</Button></header>
     <div role="toolbar" aria-label="Decisions controls" className="flex flex-wrap items-center gap-2">
       <ToolbarSearch query={query} onQueryChange={setQuery} label="Search decisions" placeholder="Search decisions or task IDs…" />
