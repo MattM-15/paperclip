@@ -149,7 +149,7 @@ export function CoordinatorNeedsYou() {
   ]).entries()], [pendingItems, recentItems]);
   const filtersActive = Boolean(query.trim() || agentFilter || projectFilter);
   const closeHistory = useCallback(() => { setHistoryOpen(false); closePanel(); }, [closePanel]);
-  const showHistory = () => setHistoryOpen(true);
+  const showHistory = () => { setHistoryOpen(true); if (!isMobile) setPanelVisible(true); };
   useEffect(() => { setBreadcrumbs([{ label: "Needs You" }]); }, [setBreadcrumbs]);
   useEffect(() => {
     setSettling([]); setHistoryOpen(false); setNow(Date.now()); closePanel();

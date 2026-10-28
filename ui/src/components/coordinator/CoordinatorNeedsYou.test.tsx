@@ -209,5 +209,11 @@ describe("Coordinator Needs You", () => {
     await click("Decision history");
     expect(fixture.openPanel).toHaveBeenCalled();
     expect(fixture.setPanelVisible).toHaveBeenCalledWith(true);
+    // The shared desktop hide control changes visibility without closing
+    // this tab. Clicking history again must reveal the already-open tab.
+    fixture.setPanelVisible(false);
+    fixture.setPanelVisible.mockClear();
+    await click("Decision history");
+    expect(fixture.setPanelVisible).toHaveBeenCalledWith(true);
   });
 });
