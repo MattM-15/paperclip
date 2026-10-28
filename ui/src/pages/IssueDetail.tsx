@@ -4014,9 +4014,10 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
   // History links restore the exact point of decision while its artifact opens
   // in the side pane. Wait for the real thread to mount, without guessing a row.
   useEffect(() => {
-    if (!coordinatorWorkspaceEnabled || !issue?.id) return;
+    if (!issue?.id) return;
     const anchor = taskChatHashAnchor(location.hash);
     if (!anchor || (!anchor.startsWith("interaction-") && !anchor.startsWith("decision-"))) return;
+    if (!coordinatorWorkspaceEnabled && !anchor.startsWith("decision-")) return;
     const focusDecision = () => {
       const target = document.getElementById(anchor);
       if (!target) return false;

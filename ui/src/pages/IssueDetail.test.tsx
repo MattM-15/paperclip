@@ -2416,6 +2416,7 @@ describe("IssueDetail", () => {
     await waitForAssertion(() => expect(container.querySelector("#decision-recorded-1")?.textContent).toContain("The copy is approved"));
     expect(container.querySelector("#decision-recorded-1")?.textContent).toContain("Own blog first");
     expect(container.querySelector("#decision-recorded-1")?.textContent).toContain("Prepare the approved blog first.");
+    await waitForAssertion(() => expect(document.activeElement?.id).toBe("decision-recorded-1"));
   });
 
   it("opens a closed desktop pane and routes an ordinary document to its own tab on direct load", async () => {
