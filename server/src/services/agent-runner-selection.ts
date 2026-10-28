@@ -333,14 +333,13 @@ export async function resolveAgentRunnerTargetForCompany(db: Db, companyId: stri
     if (taskDriver) target = { driver, runnerTasks: true, ...(taskDriver.warmTaskVersion === 1 ? { warmTaskVersion: 1 as const } : {}) };
   }
   if (driver === "sandbox" && environment) {
-    let managedCloudImage = usesManagedCloudSandboxImage(environment, null);
-    if (managedCloudImage) {
-      await resolveEnvironmentDriverConfigForRuntime(db, companyId, environment, {
-        applyCustomImageTemplate: true,
-        readOnlyCustomImageTemplate: true,
-        onResolvedCustomImageTemplate: () => { managedCloudImage = false; },
+    if (usesManagedCloudSandboxImage(environment, null)) {
+      const { environmentCustomImageService } = await import("./environment-custom-images.js");
+      const template = await environmentCustomImageService(db).getActiveTemplate({
+        environmentId: environment.id,
+        provider: typeof environment.config.provider === "string" ? environment.config.provider : null,
       });
-      if (managedCloudImage) return { driver, managedCloudImage: true };
+      if (!template?.templateRef) return { driver, managedCloudImage: true };
     }
     const { readSandboxPlatformQualification } = await import("./environment-probe.js");
     const qualified = await readSandboxPlatformQualification(db, environment, companyId);

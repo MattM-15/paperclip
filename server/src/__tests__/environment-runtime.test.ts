@@ -65,6 +65,7 @@ import { createNativeHarnessBackupStamp } from "../services/native-runtime/nativ
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
 const sshFixtureSupport = await getSshEnvLabSupport();
+const managedCloudConfig = { v: 1, mode: "cloud", catalogVersion: "test", features: {}, plugins: { autoInstall: ["daytona"] } };
 
 if (!embeddedPostgresSupport.supported) {
   console.warn(
@@ -328,8 +329,9 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     } as unknown as PluginWorkerManager;
   }
 
-  it.each(["missing", "stale", "invalidated", "qualified", "provider-failure"])("uses the current managed Cloud snapshot with %s qualification", async qualification => {
-    vi.stubEnv("PAPERCLIP_MANAGED_CONFIG", "{}");
+  it.each(["missing", "stale", "invalidated", "qualified", "provider-failure", "unowned-marker"])("uses the current managed Cloud snapshot with %s qualification", async qualification => {
+    vi.stubEnv("PAPERCLIP_MANAGED_CONFIG", JSON.stringify({ ...managedCloudConfig,
+      environments: qualification === "unowned-marker" ? [] : [{ name: "Paperclip Computer", provider: "daytona", config: {} }] }));
     const pluginId = randomUUID();
     const { companyId, environment: baseEnvironment, runId } = await seedEnvironment();
     const config = { provider: "daytona", snapshot: "replacement-snapshot", timeoutMs: 1234 };
@@ -361,6 +363,11 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       companyId, environment, issueId: null, heartbeatRunId: runId,
       persistedExecutionWorkspace: null, adapterType: "paperclip_runner",
     });
+    if (qualification === "unowned-marker") {
+      await expect(acquire).rejects.toThrow("sandbox_snapshot_qualification_required");
+      expect(worker.call).not.toHaveBeenCalled();
+      return;
+    }
     if (qualification === "provider-failure") {
       await expect(acquire).rejects.toThrow("Provider image startup failed.");
       return;

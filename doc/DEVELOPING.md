@@ -1048,6 +1048,9 @@ directly to that runtime check when discovery already offers Paperclip Runner.
 Company access, adapter availability, credentials and runtime integrity checks
 still apply. Self-hosted sandboxes, custom environments and active captured
 custom images keep their existing qualification and snapshot binding.
+The active Cloud configuration must still provision the sandbox provider; a
+leftover managed marker alone does not enable this policy. Discovery reads
+custom-image metadata without resolving provider credentials.
 
 ### Local Linux runner qualification
 

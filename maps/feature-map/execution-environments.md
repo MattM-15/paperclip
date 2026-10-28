@@ -57,6 +57,8 @@ a saved qualification prerequisite. A missing, stale or revoked qualification
 does not block execution or pin an older snapshot. Runtime startup and the
 handshake detect real incompatibility. This exception excludes custom
 environments and active captured custom images.
+The active Cloud configuration must provision the sandbox provider. A stale
+managed marker alone keeps the normal qualification rules.
 
 For other images, the measured record is server-owned, company-bound and tied to the effective
 configuration and active custom-image identity. Mutable tags, provider defaults

@@ -114,6 +114,8 @@ or execution. The server checks company access before applying this policy.
 Execution uses the platform-selected image and keeps runtime startup checks.
 Self-hosted environments and active captured custom images keep qualification.
 This exception does not grant access to the probe endpoints.
+The active Cloud provisioner configuration must cover the provider; a leftover
+metadata marker is insufficient. Discovery does not resolve provider secrets.
 
 Evidence: `source-only` — [implementation](../../server/src/routes/environments.ts#L353)
 at the reviewed commit above.
