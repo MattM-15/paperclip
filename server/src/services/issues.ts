@@ -231,6 +231,7 @@ import { buildIssueChanges } from "./issue-change-receipt.js";
 import { ensurePersonalPrivateProject } from "./projects.js";
 import { projectSafeChatPublication } from "./chat-publication-projection.js";
 import { issueThreadInteractionAttentionAgentAllowed } from "./issue-thread-interaction-resolution.js";
+import { admitRunlessAgentComment } from "./cross-issue-influence-limit.js";
 
 const ALL_ISSUE_STATUSES = [
   "backlog",
@@ -12747,6 +12748,19 @@ export function issueService(db: Db) {
           if (existing.body !== redactedBody) throw conflict("Message request ID was already used for different content");
           return existing;
         }
+      }
+      if (
+        actor.agentId &&
+        !actor.userId &&
+        !actor.runId &&
+        options?.clientRequestId
+      ) {
+        await admitRunlessAgentComment(dbOrTx, {
+          companyId: issue.companyId,
+          agentId: actor.agentId,
+          issueId,
+          responsibleUserId: actor.onBehalfOfUserId,
+        });
       }
       if (issue.conversationAgentId && actor.runId) {
         const [run] = await dbOrTx.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, actor.runId));

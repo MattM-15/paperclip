@@ -93,7 +93,10 @@ async function createApp(db: Db, actor: Express.Request["actor"]) {
   app.use("/api", issueRoutes(db, {} as never));
   app.use("/api", activityRoutes(db));
   app.use((error: any, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
-    res.status(error.status ?? 500).json({ error: error.message ?? "Internal server error" });
+    res.status(error.status ?? 500).json({
+      error: error.message ?? "Internal server error",
+      ...(error.details === undefined ? {} : { details: error.details }),
+    });
   });
   return app;
 }
@@ -360,6 +363,10 @@ describeEmbeddedPostgres("issue comment attribution and patch audit routes", () 
       eq(activityLog.entityId, fixture.issue.id),
       eq(activityLog.action, "issue.comment_added"),
     ))).toHaveLength(1);
+    expect(await db.select().from(activityLog).where(and(
+      eq(activityLog.agentId, fixture.actorAgent.id),
+      eq(activityLog.action, "issue.runless_agent_comment_admitted"),
+    ))).toHaveLength(1);
     expect(wakeOptions.idempotencyKey).toBe(
       `issue-comment:${first.body.id}:${fixture.targetAgent.id}`,
     );
@@ -368,6 +375,94 @@ describeEmbeddedPostgres("issue comment attribution and patch audit routes", () 
       .send({ ...input, body: "Changed content for the same receipt" });
     expect(changed.status).toBe(409);
     expect(await db.select().from(issueComments)).toHaveLength(1);
+  }, 30_000);
+
+  it("caps fresh no-run comments across app instances and keeps saturation replays free", async () => {
+    const fixture = await seed();
+    await db.update(issues).set({
+      status: "todo",
+      createdByAgentId: fixture.actorAgent.id,
+      createdByUserId: null,
+    }).where(eq(issues.id, fixture.issue.id));
+    const secondIssue = await db.insert(issues).values({
+      companyId: fixture.company.id,
+      title: "Second creator issue",
+      status: "todo",
+      priority: "medium",
+      assigneeAgentId: fixture.targetAgent.id,
+      createdByAgentId: fixture.actorAgent.id,
+    }).returning().then((rows) => rows[0]!);
+    const secondDb = createDb(tempDb!.connectionString);
+    try {
+      const actor = noRunAgentActor(fixture);
+      const [firstApp, secondApp] = await Promise.all([
+        createApp(db, actor),
+        createApp(secondDb, actor),
+      ]);
+      const inputs = Array.from({ length: 21 }, (_, index) => ({
+        body: `fresh creator comment ${index}`,
+        clientRequestId: randomUUID(),
+      }));
+      const responses = await Promise.all(inputs.map((input, index) =>
+        request(index % 2 === 0 ? firstApp : secondApp)
+          .post(`/api/issues/${index % 2 === 0 ? fixture.issue.id : secondIssue.id}/comments`)
+          .send(input),
+      ));
+
+      expect(responses.map((response) => response.status).sort()).toEqual([
+        ...Array.from({ length: 20 }, () => 201),
+        429,
+      ]);
+      const rejected = responses.find((response) => response.status === 429)!;
+      expect(rejected.body).toMatchObject({
+        details: {
+          code: "runless_agent_comment_rate_limited",
+          limit: 20,
+          windowSeconds: 60,
+          retryAfterSeconds: expect.any(Number),
+        },
+      });
+      expect(await db.select().from(issueComments).where(
+        eq(issueComments.authorAgentId, fixture.actorAgent.id),
+      )).toHaveLength(20);
+      expect(await db.select().from(activityLog).where(and(
+        eq(activityLog.agentId, fixture.actorAgent.id),
+        eq(activityLog.action, "issue.runless_agent_comment_admitted"),
+      ))).toEqual(Array.from({ length: 20 }, () => expect.objectContaining({
+        responsibleUserId: fixture.responsibleUserId,
+      })));
+      expect(await db.select().from(activityLog).where(and(
+        eq(activityLog.agentId, fixture.actorAgent.id),
+        eq(activityLog.action, "issue.comment_added"),
+      ))).toHaveLength(20);
+      expect(mockHeartbeat.wakeup).toHaveBeenCalledTimes(20);
+
+      const acceptedIndex = responses.findIndex((response) => response.status === 201);
+      const replay = await request(acceptedIndex % 2 === 0 ? firstApp : secondApp)
+        .post(`/api/issues/${acceptedIndex % 2 === 0 ? fixture.issue.id : secondIssue.id}/comments`)
+        .send(inputs[acceptedIndex]);
+      expect(replay.status, JSON.stringify(replay.body)).toBe(201);
+      expect(await db.select().from(issueComments).where(
+        eq(issueComments.authorAgentId, fixture.actorAgent.id),
+      )).toHaveLength(20);
+      expect(await db.select().from(activityLog).where(and(
+        eq(activityLog.agentId, fixture.actorAgent.id),
+        eq(activityLog.action, "issue.runless_agent_comment_admitted"),
+      ))).toHaveLength(20);
+      expect(await db.select().from(activityLog).where(and(
+        eq(activityLog.agentId, fixture.actorAgent.id),
+        eq(activityLog.action, "issue.comment_added"),
+      ))).toHaveLength(20);
+      expect(mockHeartbeat.wakeup).toHaveBeenCalledTimes(21);
+
+      const rotatedKey = await request(secondApp)
+        .post(`/api/issues/${secondIssue.id}/comments`)
+        .send({ body: "A different key must share the agent quota", clientRequestId: randomUUID() });
+      expect(rotatedKey.status, JSON.stringify(rotatedKey.body)).toBe(429);
+      expect(mockHeartbeat.wakeup).toHaveBeenCalledTimes(21);
+    } finally {
+      await secondDb.$client.end({ timeout: 5 });
+    }
   }, 30_000);
 
   it("wakes when a retry finalizes a receipt whose initial finalization failed", async () => {
@@ -386,6 +481,10 @@ describeEmbeddedPostgres("issue comment attribution and patch audit routes", () 
     const failed = await request(app).post(`/api/issues/${fixture.issue.id}/comments`).send(input);
     expect(failed.status).toBe(500);
     expect(await db.select().from(issueComments)).toHaveLength(1);
+    expect(await db.select().from(activityLog).where(eq(
+      activityLog.action,
+      "issue.runless_agent_comment_admitted",
+    ))).toHaveLength(1);
     expect(await db.select().from(activityLog).where(eq(activityLog.action, "issue.comment_added"))).toHaveLength(0);
     expect(mockHeartbeat.wakeup).not.toHaveBeenCalled();
 
@@ -396,6 +495,10 @@ describeEmbeddedPostgres("issue comment attribution and patch audit routes", () 
     expect(await db.select().from(activityLog).where(and(
       eq(activityLog.entityId, fixture.issue.id),
       eq(activityLog.action, "issue.comment_added"),
+    ))).toHaveLength(1);
+    expect(await db.select().from(activityLog).where(eq(
+      activityLog.action,
+      "issue.runless_agent_comment_admitted",
     ))).toHaveLength(1);
     expect(mockExternalObjects.syncCommentSafely).toHaveBeenCalledTimes(1);
     expect(mockExternalObjects.syncCommentSafely).toHaveBeenCalledWith(retry.body.id);
@@ -439,6 +542,10 @@ describeEmbeddedPostgres("issue comment attribution and patch audit routes", () 
       .send(input);
     expect(failed.status).toBe(500);
     expect(await db.select().from(issueComments)).toHaveLength(1);
+    expect(await db.select().from(activityLog).where(eq(
+      activityLog.action,
+      "issue.runless_agent_comment_admitted",
+    ))).toHaveLength(1);
     expect(await db.select().from(activityLog).where(and(
       eq(activityLog.entityId, fixture.issue.id),
       eq(activityLog.action, "issue.comment_added"),
@@ -454,6 +561,10 @@ describeEmbeddedPostgres("issue comment attribution and patch audit routes", () 
         `issue-comment:${retry.body.id}:${fixture.targetAgent.id}`,
         `issue-comment:${retry.body.id}:${fixture.targetAgent.id}`,
       ]);
+    expect(await db.select().from(activityLog).where(eq(
+      activityLog.action,
+      "issue.runless_agent_comment_admitted",
+    ))).toHaveLength(1);
   }, 30_000);
 
   it("wakes only the replay that finalizes receipt activity before the original request", async () => {

@@ -928,7 +928,11 @@ the same company. It accepts only a plain body and UUID `clientRequestId`, witho
 attachments, lifecycle intent, structured fields, or client-selected attribution.
 The request key is scoped by issue and author agent: an identical redacted-body
 retry returns the existing comment without another activity or assignee wake, a
-changed body returns 409, and concurrent retries serialize on the issue row. Every
+changed body returns 409, and concurrent retries serialize on the issue row. Fresh
+no-run comment admissions are limited to 20 per rolling minute for each company and
+agent across request keys and issues. Admission is recorded separately from the
+exactly-once `issue.comment_added` audit; retries and rolled-back comments do not
+consume another admission. Every
 other no-run or cross-issue write retains the persisted-run requirement.
 A run may attempt at most 20 cross-issue comments, issue
 updates, or issue-thread interaction resolutions across one shared counter. The
