@@ -1,4 +1,4 @@
-import { assertQualityReviewPolicyMutation, assertQualityReviewPolicyReuse, assertRequiredQualityReviewComplete, requiredQualityReview } from "./required-quality-review.js";
+import { notifyChatInboundWakeNotices } from "./chat-inbound-wake-notice-notifications.js";
 import { notifyChatRunMilestones } from "./chat-run-milestone-notifications.js";
 import { notifyApprovalWork } from "./approval-work-notifications.js";
 import { notifyDecisionTargetWork, notifyDecisionTargetIssueRemoval } from "./decision-targets.js";
@@ -173,6 +173,7 @@ import {
   buildInitialIssueMonitorFields,
   normalizeIssueExecutionPolicy,
 } from "./issue-execution-policy.js";
+import { assertQualityReviewPolicyMutation, assertQualityReviewPolicyReuse, assertRequiredQualityReviewComplete, requiredQualityReview } from "./required-quality-review.js";
 import { instanceSettingsService } from "./instance-settings.js";
 import { redactCurrentUserText } from "../log-redaction.js";
 import { redactSensitiveText } from "../redaction.js";
@@ -11334,6 +11335,9 @@ export function issueService(db: Db) {
           });
         }
         if (changesPrivacy) {
+          // Privacy inherited through task ancestry can authorize saved notices
+          // on descendants as well as this task.
+          await notifyChatInboundWakeNotices(tx, { companyId: receiptExisting.companyId });
           const nextProjectId = issueData.projectId !== undefined ? issueData.projectId : receiptExisting.projectId;
           const [privacyProject] = nextProjectId ? await tx.select().from(projects)
             .where(and(eq(projects.id, nextProjectId), eq(projects.companyId, existing.companyId))) : [];
@@ -11415,6 +11419,7 @@ export function issueService(db: Db) {
           // Invalidate human direction at the common assignment boundary, including
           // plugin/service writes that do not go through HTTP run cancellation.
           // Keep the requester attribution for audit; cancellation revokes its use.
+          await notifyChatInboundWakeNotices(tx, { companyId: receiptExisting.companyId });
           await tx.update(agentWakeupRequests).set({ status: "cancelled", finishedAt: new Date(), updatedAt: new Date() })
             .where(and(eq(agentWakeupRequests.companyId, receiptExisting.companyId),
               eq(agentWakeupRequests.requestedByActorType, "user"),
@@ -11442,6 +11447,9 @@ export function issueService(db: Db) {
         }
         if (patch.status === "done" || patch.status === "cancelled") {
           await notifyDecisionTargetWork(tx, `issue:${id}`);
+        }
+        if (patch.status !== undefined && patch.status !== receiptExisting.status) {
+          await notifyChatInboundWakeNotices(tx, { companyId: receiptExisting.companyId, issueId: id });
         }
         if (patch.hiddenAt === null && receiptExisting.hiddenAt !== null) {
           await notifyChatRunMilestones(tx, { companyId: receiptExisting.companyId, issueId: id });
@@ -12633,6 +12641,11 @@ export function issueService(db: Db) {
 
       return db.transaction(async (tx) => {
         if (!(await lockIssueForCommentMutation(tx, commentId))) return null;
+        const [source] = await tx.select({ companyId: issueComments.companyId, issueId: issueComments.issueId })
+          .from(issueComments).where(and(eq(issueComments.id, commentId), isNull(issueComments.deletedAt)))
+          .for("update");
+        if (!source) return null;
+        await notifyChatInboundWakeNotices(tx, source);
         const now = new Date();
         const [comment] = await tx
           .update(issueComments)
