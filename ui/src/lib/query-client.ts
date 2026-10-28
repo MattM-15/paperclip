@@ -148,13 +148,6 @@ class AppQueryClient extends QueryClient {
     };
   }
 
-  /**
-   * Skip cache-only entries. A `setQueryData` alias (one task cached under its
-   * UUID and its identifier) has no `queryFn` until a view observes it, so a
-   * refetch can only fail with "Missing queryFn". `invalidateQueries` still
-   * marks it stale, and the next view that mounts it fetches with its own
-   * `queryFn`.
-   */
   override refetchQueries<TTaggedQueryKey extends QueryKey = QueryKey>(
     filters?: RefetchQueryFilters<TTaggedQueryKey>,
     options?: RefetchOptions,

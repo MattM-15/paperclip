@@ -277,7 +277,6 @@ describe("createAppQueryClient", () => {
   });
 
   it("leaves a cache-only alias stale instead of refetching it without a queryFn", async () => {
-    // A task is seeded under its UUID while the page observes its identifier.
     client.setQueryData(["issues", "detail", "issue-uuid"], { id: "issue-uuid", title: "Seeded" });
     const queryFn = vi.fn(async () => "fetched");
     client.setQueryData(["issues", "detail", "PAP-1"], "seeded");
@@ -295,7 +294,6 @@ describe("createAppQueryClient", () => {
     expect(queryFn).toHaveBeenCalledTimes(2);
     expect(reportError).not.toHaveBeenCalled();
 
-    // The next observer fetches the stale alias with its own queryFn.
     const aliasQueryFn = vi.fn(async () => ({ id: "issue-uuid", title: "Fresh" }));
     const observer = new QueryObserver(client, { queryKey: ["issues", "detail", "issue-uuid"], queryFn: aliasQueryFn });
     const unsubscribe = observer.subscribe(() => {});
