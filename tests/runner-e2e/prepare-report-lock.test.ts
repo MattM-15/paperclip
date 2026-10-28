@@ -1,4 +1,4 @@
-import { mkdtemp, mkdir, readFile, writeFile, copyFile, rm } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, writeFile, copyFile, realpath, rm } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
@@ -37,15 +37,15 @@ it.each(['valid', 'unknown-lock', 'changed-patch', 'wrong-output'])(
         expect(await prepareReportLock(root)).toBe('reviewed-correction');
         expect(createHash('sha256').update(await readFile(lock)).digest('hex')).toBe(policy.outputSha256);
         expect(await prepareReportLock(root)).toBe('already-reviewed');
-        const before = parse(input.toString()).packages;
-        const after = parse(await readFile(lock, 'utf8')).packages;
-        expect(after).toEqual(before);
         const reviewed = parse(await readFile(lock, 'utf8'));
         const ui = JSON.parse(await readFile(path.resolve(here, '../../ui/package.json'), 'utf8'));
         for (const [name, specifier] of Object.entries(ui.dependencies)) {
-          expect(reviewed.importers.ui.dependencies[name].specifier).toBe(specifier);
+          const entry = reviewed.importers.ui.dependencies[name];
+          expect(entry.specifier).toBe(specifier);
+          if (entry.version.startsWith('link:')) continue;
+          expect(reviewed.packages, name).toHaveProperty(`${name}@${entry.version.split('(')[0]}`);
+          expect(reviewed.snapshots, name).toHaveProperty(`${name}@${entry.version}`);
         }
-
       } else {
         await expect(prepareReportLock(root)).rejects.toThrow();
         expect(await readFile(lock)).toEqual(variant === 'unknown-lock' ? Buffer.from('unknown\n') : input);
@@ -55,17 +55,17 @@ it.each(['valid', 'unknown-lock', 'changed-patch', 'wrong-output'])(
 );
 
 
-it.each(['reviewed', 'unknown'])('refreshes dependency proof only from a %s committed lock', async variant => {
-  const root = await mkdtemp(path.join(tmpdir(), 'eval-report-lock-refresh-'));
+it.each(['input', 'output', 'unknown'])('refreshes dependency proof only from a %s committed lock', async variant => {
+  const root = await realpath(await mkdtemp(path.join(tmpdir(), 'eval-report-lock-refresh-')));
   const relative = path.join(root, 'tests/runner-e2e');
-  const original = "lockfileVersion: '9.0'\nimporters: {}\n";
-  const resolved = "lockfileVersion: '9.0'\nimporters:\n  ui: {}\n";
+  const original = "lockfileVersion: '9.0'\nimporters: {}\npackages:\n  old@1.0.0: {resolution: {integrity: fixture-old}}\n";
+  const resolved = "lockfileVersion: '9.0'\nimporters:\n  ui: {}\npackages:\n  added@2.0.0: {resolution: {integrity: fixture-new}}\n";
   const hash = (value: string) => createHash('sha256').update(value).digest('hex');
   try {
     await mkdir(relative, { recursive: true });
     await writeFile(path.join(root, 'pnpm-lock.yaml'), original);
-    const initial = { inputSha256: variant === 'reviewed' ? hash(original) : '0'.repeat(64),
-      outputSha256: variant === 'reviewed' ? hash(original) : '1'.repeat(64), patchSha256: hash('historical') };
+    const initial = { inputSha256: variant === 'input' ? hash(original) : '0'.repeat(64),
+      outputSha256: variant === 'output' ? hash(original) : '1'.repeat(64), patchSha256: hash('historical') };
     await writeFile(path.join(relative, 'report-lock.json'), JSON.stringify(initial));
     await writeFile(path.join(relative, 'report-lock.patch'), 'historical');
     execFileSync('git', ['init', '-q'], { cwd: root });
@@ -79,13 +79,20 @@ it.each(['reviewed', 'unknown'])('refreshes dependency proof only from a %s comm
       expect(await readFile(path.join(root, 'pnpm-lock.yaml'), 'utf8')).toBe(resolved);
       return;
     }
-    expect(await refreshReportLock(root)).toBe('refreshed');
+    if (variant === 'output') {
+      const cli = path.join(relative, 'prepare-report-lock.mjs');
+      await copyFile(path.join(import.meta.dirname, 'prepare-report-lock.mjs'), cli);
+      expect(execFileSync(process.execPath, [cli, '--refresh'], { cwd: root, encoding: 'utf8' }).trim()).toBe('refreshed');
+    } else {
+      expect(await refreshReportLock(root)).toBe('refreshed');
+    }
     const policy = JSON.parse(await readFile(path.join(relative, 'report-lock.json'), 'utf8'));
     const patch = await readFile(path.join(relative, 'report-lock.patch'), 'utf8');
     expect(policy).toMatchObject({ inputSha256: hash(original), outputSha256: hash(resolved), patchSha256: hash(patch) });
     await writeFile(path.join(root, 'pnpm-lock.yaml'), original);
     expect(await prepareReportLock(root)).toBe('reviewed-correction');
     expect(await readFile(path.join(root, 'pnpm-lock.yaml'), 'utf8')).toBe(resolved);
+    expect(parse(await readFile(path.join(root, 'pnpm-lock.yaml'), 'utf8')).packages).toEqual(parse(resolved).packages);
     expect(await prepareReportLock(root)).toBe('already-reviewed');
     execFileSync('git', ['add', '.'], { cwd: root });
     execFileSync('git', ['-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '-qm', 'refresh'], { cwd: root });
