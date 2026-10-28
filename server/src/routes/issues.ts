@@ -18495,6 +18495,21 @@ export function issueRoutes(
         })
       )
         return;
+      const agentCreatedIssueCommentReceipt =
+        req.actor.type === "agent" &&
+        req.actor.source === "agent_key" &&
+        !req.actor.runId &&
+        req.actor.companyId === issue.companyId &&
+        req.actor.agentId === issue.createdByAgentId &&
+        Boolean(req.body.clientRequestId) &&
+        (req.body.attachmentIds?.length ?? 0) === 0 &&
+        req.body.onBehalfOfUserId == null &&
+        req.body.authorType === undefined &&
+        req.body.presentation === undefined &&
+        req.body.metadata === undefined &&
+        req.body.reopen !== true &&
+        req.body.resume !== true &&
+        req.body.interrupt !== true;
       if (req.actor.type === "board" && req.actor.userId && req.body.clientRequestId) {
         const [accepted] = await db.select({ id: issueComments.id }).from(issueComments).where(and(
           eq(issueComments.companyId, issue.companyId), eq(issueComments.issueId, issue.id),
@@ -18531,17 +18546,19 @@ export function issueRoutes(
         }
       }
       if (!(await assertBoardCommentNotPaused(req, res, issue))) return;
-      const closedExecutionWorkspace =
-        await getClosedIssueExecutionWorkspace(issue);
+      const closedExecutionWorkspace = agentCreatedIssueCommentReceipt
+        ? null
+        : await getClosedIssueExecutionWorkspace(issue);
 
       const actor = getActorInfo(req);
-      const commentPresentation =
-        req.body.presentation ??
-        (await deriveRecoveryCommentPresentation(
-          req,
-          issue.companyId,
-          req.body.body,
-        ));
+      const commentPresentation = agentCreatedIssueCommentReceipt
+        ? null
+        : req.body.presentation ??
+          (await deriveRecoveryCommentPresentation(
+            req,
+            issue.companyId,
+            req.body.body,
+          ));
       const reopenRequested = req.body.reopen === true;
       const resumeRequested = req.body.resume === true;
       const interruptRequested = req.body.interrupt === true;
@@ -18615,6 +18632,7 @@ export function issueRoutes(
           actorId: actor.actorId,
         });
       const effectiveMoveToTodoRequested =
+        !agentCreatedIssueCommentReceipt &&
         !assigneeSelfCommentOnTerminal &&
         !(isBlocked && (await getExecutionBlocker(db, issue.companyId, issue.id))?.workspaceRepairRequired) &&
         (explicitMoveToTodoRequested ||
@@ -18644,6 +18662,7 @@ export function issueRoutes(
         return;
       }
       if (
+        !agentCreatedIssueCommentReceipt &&
         !(await assertCrossIssueInfluenceWithinRunCap(
           req,
           res,
@@ -18812,6 +18831,7 @@ export function issueRoutes(
         currentIssue.executionPolicy ?? null,
       );
       const shouldAutoApproveReviewComment =
+        !agentCreatedIssueCommentReceipt &&
         currentIssue.status === "in_review" &&
         currentExecutionState?.status === "pending" &&
         actorMatchesExecutionParticipant(
@@ -18871,7 +18891,7 @@ export function issueRoutes(
           presentation: commentPresentation,
           metadata: req.body.metadata ?? null,
           attachmentIds: req.body.attachmentIds,
-          clientRequestId: actor.actorType === "user" ? req.body.clientRequestId : undefined,
+          clientRequestId: actor.actorType === "user" || agentCreatedIssueCommentReceipt ? req.body.clientRequestId : undefined,
           mirrorToSlack: actor.actorType === "user",
           sourceTrust,
         };
@@ -18984,7 +19004,7 @@ export function issueRoutes(
           presentation: commentPresentation,
           metadata: req.body.metadata ?? null,
           attachmentIds: req.body.attachmentIds,
-          clientRequestId: actor.actorType === "user" ? req.body.clientRequestId : undefined,
+          clientRequestId: actor.actorType === "user" || agentCreatedIssueCommentReceipt ? req.body.clientRequestId : undefined,
           mirrorToSlack: actor.actorType === "user",
           authorizationReason: commentAuthorizationReason,
           sourceTrust: await sourceTrustForActorWrite(currentIssue, actor),
@@ -19020,7 +19040,9 @@ export function issueRoutes(
           .catch(() => logger.warn({ issueId: currentIssue.id }, "fast response admission unavailable"));
       }
 
-      const keyedComment = req.actor.type === "board" && Boolean(req.actor.userId && req.body.clientRequestId);
+      const keyedComment =
+        (req.actor.type === "board" && Boolean(req.actor.userId && req.body.clientRequestId)) ||
+        agentCreatedIssueCommentReceipt;
       const buildCommentActivity = (commentReferenceDiff: ReturnType<typeof issueReferencesSvc.diffIssueReferenceSummary>) => ({
         companyId: currentIssue.companyId,
         actorType: actor.actorType,
@@ -19078,11 +19100,18 @@ export function issueRoutes(
           }),
         },
       });
-      if (keyedComment) await completeIssueCommentReceipt(db, issueReferencesSvc, {
-        companyId: currentIssue.companyId, issueId: currentIssue.id, commentId: comment.id,
-        referenceSummaryBefore: commentReferenceSummaryBefore, activity: buildCommentActivity,
-      });
-      else await issueReferencesSvc.syncComment(comment.id);
+      const createdCommentReceipt = keyedComment
+        ? await completeIssueCommentReceipt(db, issueReferencesSvc, {
+            companyId: currentIssue.companyId, issueId: currentIssue.id, commentId: comment.id,
+            referenceSummaryBefore: commentReferenceSummaryBefore, activity: buildCommentActivity,
+          })
+        : null;
+      if (agentCreatedIssueCommentReceipt && createdCommentReceipt === false) {
+        await externalObjectsSvc.syncCommentSafely(comment.id);
+        res.status(201).json(comment);
+        return;
+      }
+      if (!keyedComment) await issueReferencesSvc.syncComment(comment.id);
       await externalObjectsSvc.syncCommentSafely(comment.id);
       if (
         currentIssue.assigneeAgentId &&

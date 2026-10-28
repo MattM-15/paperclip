@@ -30,6 +30,51 @@ vi.mock("../services/issue-assignment-wakeup.js", () => ({
   queueIssueAssignmentWakeup: vi.fn(),
 }));
 
+const mockHeartbeat = vi.hoisted(() => ({
+  wakeup: vi.fn(async () => null),
+  reportRunActivity: vi.fn(async () => undefined),
+  getRun: vi.fn(async () => null),
+  cancelRun: vi.fn(async () => null),
+}));
+
+vi.mock("../services/heartbeat.js", async (importOriginal) => {
+  const actual = await importOriginal();
+  return { ...actual, heartbeatService: () => mockHeartbeat };
+});
+
+const mockExternalObjects = vi.hoisted(() => ({
+  syncCommentSafely: vi.fn(async () => undefined),
+}));
+
+vi.mock("../services/external-objects.js", async (importOriginal) => {
+  const actual = await importOriginal();
+  return {
+    ...actual,
+    externalObjectService: (...args: Parameters<typeof actual.externalObjectService>) => ({
+      ...actual.externalObjectService(...args),
+      syncCommentSafely: mockExternalObjects.syncCommentSafely,
+    }),
+  };
+});
+
+const receiptFinalizationControl = vi.hoisted(() => ({
+  beforeNext: null as null | (() => Promise<void>),
+}));
+
+vi.mock("../services/issue-comment-receipt.js", async (importOriginal) => {
+  const actual = await importOriginal();
+  return {
+    completeIssueCommentReceipt: async (
+      ...args: Parameters<typeof actual.completeIssueCommentReceipt>
+    ) => {
+      const before = receiptFinalizationControl.beforeNext;
+      receiptFinalizationControl.beforeNext = null;
+      if (before) await before();
+      return actual.completeIssueCommentReceipt(...args);
+    },
+  };
+});
+
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
 type Db = ReturnType<typeof createDb>;
@@ -63,6 +108,8 @@ describeEmbeddedPostgres("issue comment attribution and patch audit routes", () 
   }, 20_000);
 
   afterEach(async () => {
+    vi.clearAllMocks();
+    receiptFinalizationControl.beforeNext = null;
     await db.delete(activityLog);
     await db.delete(issueComments);
     await db.delete(heartbeatRuns);
@@ -144,7 +191,7 @@ describeEmbeddedPostgres("issue comment attribution and patch audit routes", () 
       contextSnapshot: { issueId: sourceIssue.id },
     }).returning().then((rows) => rows[0]!);
 
-    return { company, actorAgent, responsibleUserId, boardUserId, run, issue };
+    return { company, actorAgent, targetAgent, responsibleUserId, boardUserId, run, issue };
   }
 
   function agentActor(input: Awaited<ReturnType<typeof seed>>): Express.Request["actor"] {
@@ -160,6 +207,18 @@ describeEmbeddedPostgres("issue comment attribution and patch audit routes", () 
         status: "active",
       }],
       source: "agent_jwt",
+    };
+  }
+
+  function noRunAgentActor(
+    input: Awaited<ReturnType<typeof seed>>,
+    overrides: { agentId?: string; companyId?: string } = {},
+  ): Express.Request["actor"] {
+    return {
+      ...agentActor(input),
+      ...overrides,
+      runId: undefined,
+      source: "agent_key",
     };
   }
 
@@ -267,6 +326,197 @@ describeEmbeddedPostgres("issue comment attribution and patch audit routes", () 
         details: expect.objectContaining({ authorizationReason: "allow_visible_issue_write" }),
       }),
     ]));
+  }, 30_000);
+
+  it("accepts and replays a plain no-run comment on the key agent's own created issue", async () => {
+    const fixture = await seed();
+    await db.update(issues).set({
+      status: "todo",
+      createdByAgentId: fixture.actorAgent.id,
+      createdByUserId: null,
+    }).where(eq(issues.id, fixture.issue.id));
+    const app = await createApp(db, noRunAgentActor(fixture));
+    const clientRequestId = randomUUID();
+    const input = { body: "Polling produced a durable receipt", clientRequestId };
+
+    const first = await request(app).post(`/api/issues/${fixture.issue.id}/comments`).send(input);
+    expect(first.status, JSON.stringify(first.body)).toBe(201);
+    expect(first.body).toMatchObject({
+      authorAgentId: fixture.actorAgent.id,
+      createdByRunId: null,
+      clientRequestId,
+      body: input.body,
+      presentation: null,
+    });
+    await vi.waitFor(() => expect(mockHeartbeat.wakeup).toHaveBeenCalledTimes(1));
+
+    const replay = await request(app).post(`/api/issues/${fixture.issue.id}/comments`).send(input);
+    expect(replay.status, JSON.stringify(replay.body)).toBe(201);
+    expect(replay.body.id).toBe(first.body.id);
+    expect(mockHeartbeat.wakeup).toHaveBeenCalledTimes(1);
+    expect(await db.select().from(issueComments)).toHaveLength(1);
+    expect(await db.select().from(activityLog).where(and(
+      eq(activityLog.entityId, fixture.issue.id),
+      eq(activityLog.action, "issue.comment_added"),
+    ))).toHaveLength(1);
+
+    const changed = await request(app).post(`/api/issues/${fixture.issue.id}/comments`)
+      .send({ ...input, body: "Changed content for the same receipt" });
+    expect(changed.status).toBe(409);
+    expect(await db.select().from(issueComments)).toHaveLength(1);
+  }, 30_000);
+
+  it("wakes when a retry finalizes a receipt whose initial finalization failed", async () => {
+    const fixture = await seed();
+    await db.update(issues).set({
+      status: "todo",
+      createdByAgentId: fixture.actorAgent.id,
+      createdByUserId: null,
+    }).where(eq(issues.id, fixture.issue.id));
+    const app = await createApp(db, noRunAgentActor(fixture));
+    const input = { body: "Retry finalizes the receipt", clientRequestId: randomUUID() };
+    receiptFinalizationControl.beforeNext = async () => {
+      throw new Error("receipt finalization failed");
+    };
+
+    const failed = await request(app).post(`/api/issues/${fixture.issue.id}/comments`).send(input);
+    expect(failed.status).toBe(500);
+    expect(await db.select().from(issueComments)).toHaveLength(1);
+    expect(await db.select().from(activityLog).where(eq(activityLog.action, "issue.comment_added"))).toHaveLength(0);
+    expect(mockHeartbeat.wakeup).not.toHaveBeenCalled();
+
+    const retry = await request(app).post(`/api/issues/${fixture.issue.id}/comments`).send(input);
+    expect(retry.status, JSON.stringify(retry.body)).toBe(201);
+    await vi.waitFor(() => expect(mockHeartbeat.wakeup).toHaveBeenCalledTimes(1));
+    expect(await db.select().from(issueComments)).toHaveLength(1);
+    expect(await db.select().from(activityLog).where(and(
+      eq(activityLog.entityId, fixture.issue.id),
+      eq(activityLog.action, "issue.comment_added"),
+    ))).toHaveLength(1);
+    expect(mockExternalObjects.syncCommentSafely).toHaveBeenCalledTimes(1);
+    expect(mockExternalObjects.syncCommentSafely).toHaveBeenCalledWith(retry.body.id);
+  }, 30_000);
+
+  it("wakes only the replay that finalizes receipt activity before the original request", async () => {
+    const fixture = await seed();
+    await db.update(issues).set({
+      status: "todo",
+      createdByAgentId: fixture.actorAgent.id,
+      createdByUserId: null,
+    }).where(eq(issues.id, fixture.issue.id));
+    const app = await createApp(db, noRunAgentActor(fixture));
+    const input = { body: "Replay wins receipt finalization", clientRequestId: randomUUID() };
+    const originalAtReceipt = Promise.withResolvers<void>();
+    const releaseOriginal = Promise.withResolvers<void>();
+    receiptFinalizationControl.beforeNext = async () => {
+      originalAtReceipt.resolve();
+      await releaseOriginal.promise;
+    };
+
+    const original = request(app).post(`/api/issues/${fixture.issue.id}/comments`).send(input)
+      .then((response) => response);
+    await originalAtReceipt.promise;
+    const replay = await (async () => {
+      try {
+        return await request(app).post(`/api/issues/${fixture.issue.id}/comments`).send(input);
+      } finally {
+        releaseOriginal.resolve();
+      }
+    })();
+    const originalResponse = await original;
+
+    expect(replay.status, JSON.stringify(replay.body)).toBe(201);
+    expect(originalResponse.status, JSON.stringify(originalResponse.body)).toBe(201);
+    expect(originalResponse.body.id).toBe(replay.body.id);
+    await vi.waitFor(() => expect(mockHeartbeat.wakeup).toHaveBeenCalledTimes(1));
+    expect(await db.select().from(issueComments)).toHaveLength(1);
+    expect(await db.select().from(activityLog).where(and(
+      eq(activityLog.entityId, fixture.issue.id),
+      eq(activityLog.action, "issue.comment_added"),
+    ))).toHaveLength(1);
+    expect(mockHeartbeat.wakeup).toHaveBeenCalledTimes(1);
+  }, 30_000);
+
+  it("keeps no-run comments and updates denied for non-creators and other companies", async () => {
+    const fixture = await seed();
+    const app = await createApp(db, noRunAgentActor(fixture));
+    const input = { body: "Unrelated no-run write", clientRequestId: randomUUID() };
+
+    const userCreated = await request(app).post(`/api/issues/${fixture.issue.id}/comments`).send(input);
+    expect(userCreated.status).toBe(403);
+
+    await db.update(issues).set({ createdByAgentId: fixture.targetAgent.id }).where(eq(issues.id, fixture.issue.id));
+    const otherAgentCreated = await request(app).post(`/api/issues/${fixture.issue.id}/comments`).send(input);
+    expect(otherAgentCreated.status).toBe(403);
+
+    await db.update(issues).set({ createdByAgentId: fixture.actorAgent.id }).where(eq(issues.id, fixture.issue.id));
+    const otherCompany = await request(await createApp(db, noRunAgentActor(fixture, { companyId: randomUUID() })))
+      .post(`/api/issues/${fixture.issue.id}/comments`).send(input);
+    expect(otherCompany.status).toBe(404);
+
+    const patch = await request(app).patch(`/api/issues/${fixture.issue.id}`).send({ title: "Still denied" });
+    expect(patch.status).toBe(403);
+    expect(await db.select().from(issueComments)).toHaveLength(0);
+    expect(mockHeartbeat.wakeup).not.toHaveBeenCalled();
+  }, 30_000);
+
+  it("does not widen the no-run creator exception to attachments, lifecycle, structure, or attribution", async () => {
+    const fixture = await seed();
+    await db.update(issues).set({
+      status: "todo",
+      createdByAgentId: fixture.actorAgent.id,
+      createdByUserId: null,
+    }).where(eq(issues.id, fixture.issue.id));
+    const app = await createApp(db, noRunAgentActor(fixture));
+    const cases: Array<Record<string, unknown>> = [
+      { attachmentIds: [randomUUID()] },
+      { reopen: true },
+      { resume: true },
+      { interrupt: true },
+      { presentation: null },
+      { metadata: null },
+      { authorType: "user" },
+      { onBehalfOfUserId: "someone-else" },
+      { clientRequestId: undefined },
+    ];
+
+    for (const extra of cases) {
+      const response = await request(app).post(`/api/issues/${fixture.issue.id}/comments`).send({
+        body: "Must remain a plain keyed comment",
+        clientRequestId: randomUUID(),
+        ...extra,
+      });
+      expect([400, 401, 403, 409, 422], JSON.stringify(response.body)).toContain(response.status);
+    }
+    expect(await db.select().from(issueComments)).toHaveLength(0);
+    expect(mockHeartbeat.wakeup).not.toHaveBeenCalled();
+  }, 30_000);
+
+  it("leaves one comment, activity, and wake after concurrent creator retries", async () => {
+    const fixture = await seed();
+    await db.update(issues).set({
+      status: "todo",
+      createdByAgentId: fixture.actorAgent.id,
+      createdByUserId: null,
+    }).where(eq(issues.id, fixture.issue.id));
+    const app = await createApp(db, noRunAgentActor(fixture));
+    const input = { body: "Concurrent poller receipt", clientRequestId: randomUUID() };
+
+    const responses = await Promise.all(Array.from({ length: 4 }, () =>
+      request(app).post(`/api/issues/${fixture.issue.id}/comments`).send(input),
+    ));
+    for (const response of responses) {
+      expect(response.status, JSON.stringify(response.body)).toBe(201);
+      expect(response.body.id).toBe(responses[0]!.body.id);
+    }
+    await vi.waitFor(() => expect(mockHeartbeat.wakeup).toHaveBeenCalledTimes(1));
+
+    expect(await db.select().from(issueComments)).toHaveLength(1);
+    expect(await db.select().from(activityLog).where(and(
+      eq(activityLog.entityId, fixture.issue.id),
+      eq(activityLog.action, "issue.comment_added"),
+    ))).toHaveLength(1);
+    expect(mockHeartbeat.wakeup).toHaveBeenCalledTimes(1);
   }, 30_000);
 
   it("rejects and audits an agent-supplied onBehalfOfUserId", async () => {

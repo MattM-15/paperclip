@@ -6925,4 +6925,40 @@ describeEmbeddedPostgres("issueService.addComment createdByRunId", () => {
       .where(eq(issueComments.createdByRunId, runId));
     expect(duplicates).toHaveLength(1);
   });
+
+  it("serializes no-run agent request keys by issue and author", async () => {
+    const clientRequestId = randomUUID();
+    const [first, replay] = await Promise.all([
+      svc.addComment(issueId, "poller receipt", { agentId }, { clientRequestId }),
+      svc.addComment(issueId, "poller receipt", { agentId }, { clientRequestId }),
+    ]);
+
+    expect(replay.id).toBe(first.id);
+    await expect(
+      svc.addComment(issueId, "changed receipt", { agentId }, { clientRequestId }),
+    ).rejects.toMatchObject({ status: 409 });
+
+    const otherAgentId = randomUUID();
+    await db.insert(agents).values({
+      id: otherAgentId,
+      companyId,
+      name: "OtherTestAgent",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    const otherAuthor = await svc.addComment(
+      issueId,
+      "other author receipt",
+      { agentId: otherAgentId },
+      { clientRequestId },
+    );
+    expect(otherAuthor.id).not.toBe(first.id);
+    expect(await db.select({ id: issueComments.id }).from(issueComments).where(
+      eq(issueComments.clientRequestId, clientRequestId),
+    )).toHaveLength(2);
+  });
 });
