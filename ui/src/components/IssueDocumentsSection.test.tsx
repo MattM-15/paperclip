@@ -26,6 +26,7 @@ const markdownEditorMockState = vi.hoisted(() => ({
   emitMountEmptyChange: false,
   /** Typed into the editor on mount, for forms the test cannot type into. */
   emitMountValue: null as string | null,
+  changeBody: null as null | ((body: string) => void),
 }));
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -102,6 +103,7 @@ vi.mock("./MarkdownEditor", async () => {
         onChange?.("");
       }, []);
 
+      markdownEditorMockState.changeBody = onChange ?? null;
       return (
         <div className={contentClassName} data-testid="markdown-editor">
           {value || placeholder || ""}
@@ -300,6 +302,7 @@ describe("IssueDocumentsSection", () => {
     vi.clearAllMocks();
     markdownEditorMockState.emitMountEmptyChange = false;
     markdownEditorMockState.emitMountValue = null;
+    markdownEditorMockState.changeBody = null;
     mockSession.unreachable = false;
     mockLocation.hash = "";
   });
@@ -348,6 +351,38 @@ describe("IssueDocumentsSection", () => {
     await flush();
     expect(container.textContent).toContain("The reviewed revision is unavailable");
     expect(container.textContent).not.toContain("Newer unreviewed text");
+    await act(async () => root.unmount());
+    queryClient.clear();
+  });
+
+  it.each(["loaded", "failed"])("preserves an unsaved draft when linked revision loading %s", async (outcome) => {
+    const root = createRoot(container);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const storageKey = "paperclip:document-draft:v2:user-1:issue-1:plan";
+    localStorage.setItem(storageKey, JSON.stringify({ key: "plan", title: "Plan", body: "My unsaved draft", baseRevisionId: "revision-4", isNew: false }));
+    mockIssuesApi.listDocuments.mockResolvedValue([createIssueDocument({ body: "Saved latest body" })]);
+    let load!: (value: DocumentRevision[]) => void;
+    let fail!: (error: Error) => void;
+    mockIssuesApi.listDocumentRevisions.mockReturnValue(new Promise<DocumentRevision[]>((resolve, reject) => { load = resolve; fail = reject; }));
+    const show = () => root.render(<QueryClientProvider client={queryClient}><IssueDocumentsSection issue={createIssue()} canDeleteDocuments={false} /></QueryClientProvider>);
+    await act(async () => show());
+    await flush();
+    await flush();
+    expect(container.querySelector('[data-testid="markdown-editor"]')?.textContent).toBe("My unsaved draft");
+    mockLocation.hash = "#document-plan&revision=revision-3&interaction=review-1";
+    await act(async () => show());
+    await flush();
+    expect(container.querySelector('[data-testid="markdown-editor"]')?.textContent).toBe("My unsaved draft");
+    expect(JSON.parse(localStorage.getItem(storageKey)!).body).toBe("My unsaved draft");
+    await act(async () => outcome === "loaded" ? load([createRevision()]) : fail(new Error("Disconnected")));
+    await flush();
+    await flush();
+    expect(container.textContent).toContain(outcome === "loaded" ? "Save or cancel your local changes" : "Could not load the reviewed revision");
+    expect(container.querySelector('[data-testid="markdown-editor"]')?.textContent).toBe("My unsaved draft");
+    await act(async () => markdownEditorMockState.changeBody!("My unsaved draft, continued"));
+    await flush();
+    expect(JSON.parse(localStorage.getItem(storageKey)!).body).toBe("My unsaved draft, continued");
+    expect(mockIssuesApi.upsertDocument).not.toHaveBeenCalled();
     await act(async () => root.unmount());
     queryClient.clear();
   });

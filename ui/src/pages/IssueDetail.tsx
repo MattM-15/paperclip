@@ -994,8 +994,10 @@ function useTaskDetailInterfaceMode(conversationMode = false) {
 
 export function IssueDetailLoadingState({
   headerSeed,
+  titleEditor,
 }: {
   headerSeed: ReturnType<typeof readIssueDetailHeaderSeed>;
+  titleEditor?: React.ReactNode;
 }) {
   const identifier =
     headerSeed?.identifier ?? headerSeed?.id.slice(0, 8) ?? null;
@@ -1009,7 +1011,7 @@ export function IssueDetailLoadingState({
           : "max-w-3xl space-y-6"
       }
     >
-      <div className="space-y-3">
+      <div className="space-y-3" data-testid={titleEditor ? "issue-detail-header" : undefined}>
         <Skeleton className="h-3 w-40" />
 
         <div className="flex items-center gap-2 min-w-0 flex-wrap">
@@ -1067,9 +1069,9 @@ export function IssueDetailLoadingState({
 
         {headerSeed ? (
           <>
-            <h2 className="text-xl font-bold leading-tight">
+            {titleEditor ?? <h2 className="text-xl font-bold leading-tight">
               {headerSeed.title}
-            </h2>
+            </h2>}
             <div className="space-y-2">
               <Skeleton className="h-4 w-full max-w-xl" />
               <Skeleton className="h-4 w-(--pct-72)" />
@@ -7228,6 +7230,17 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
   if (!taskRouteReady || !taskInterfaceSettingsLoaded)
     return (
       <IssueDetailLoadingState
+        titleEditor={taskRouteReady && !issue.conversationAgentId ? (
+          // The account-bound title editor can retain input before the first
+          // session lookup. Presentation-specific controls still wait below.
+          <InlineEditor
+            value={issue.title}
+            onSave={(title) => updateIssue.mutateAsync({ title })}
+            draftKey={`issue:${issue.id}:title`}
+            as="h2"
+            className="text-xl font-semibold leading-normal"
+          />
+        ) : undefined}
         headerSeed={
           loadedIssue
             ? readIssueDetailHeaderSeed(

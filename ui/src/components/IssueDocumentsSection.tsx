@@ -794,13 +794,13 @@ function AccountIssueDocumentsSection({
     const revisionState = deriveDocumentRevisionState(doc, getDocumentRevisions(doc.key));
     const selectedRevision = revisionState.revisions.find((revision) => revision.id === revisionId);
     if (!selectedRevision) return false;
-    if (selectedRevision.id === revisionState.currentRevision.id) {
-      returnToLatestRevision(doc.key);
-      return true;
-    }
     if (documentConflict?.key === doc.key || documentHasUnsavedChanges(doc, draft)) {
       setError("Save or cancel your local changes before viewing an older revision.");
       return false;
+    }
+    if (selectedRevision.id === revisionState.currentRevision.id) {
+      returnToLatestRevision(doc.key);
+      return true;
     }
     resetAutosaveState();
     setDraft((current) => current?.key === doc.key ? null : current);
@@ -1137,9 +1137,7 @@ function AccountIssueDocumentsSection({
             : activeDraft?.title ?? currentRevision.title ?? "";
           const waitingForLinkedRevision = documentHashTarget?.documentKey === doc.key
             && Boolean(documentHashTarget.revisionId) && handledRevisionHash !== location.hash;
-          const displayedBody = waitingForLinkedRevision
-            ? (error ?? "Loading reviewed revision…")
-            : selectedHistoricalRevision?.body ?? activeDraft?.body ?? currentRevision.body;
+          const displayedBody = selectedHistoricalRevision?.body ?? activeDraft?.body ?? currentRevision.body;
           const displayedRevisionNumber = selectedHistoricalRevision?.revisionNumber ?? currentRevision.revisionNumber;
           const displayedUpdatedAt = selectedHistoricalRevision?.createdAt ?? currentRevision.createdAt;
           const showTitle = !isPlanKey(doc.key) && !!displayedTitle.trim() && !titlesMatchKey(displayedTitle, doc.key);
@@ -1291,6 +1289,11 @@ function AccountIssueDocumentsSection({
                       }
                     : undefined}
                 >
+                  {waitingForLinkedRevision ? (
+                    <p role="status" className="text-sm text-muted-foreground">
+                      {error ?? "Loading reviewed revision…"}
+                    </p>
+                  ) : null}
                   {isHistoricalPreview && selectedHistoricalRevision && (
                     <div className="rounded-md border border-amber-500/30 bg-amber-500/5 px-3 py-3">
                       <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
@@ -1405,7 +1408,9 @@ function AccountIssueDocumentsSection({
                     }`}
                   >
                     {(() => {
-                      const renderedDocumentBody = isHistoricalPreview ? (
+                      // Loading and error copy must never become editor input
+                      // or annotation content. A blocked draft stays editable.
+                      const renderedDocumentBody = waitingForLinkedRevision && !activeDraft ? null : isHistoricalPreview ? (
                         renderFoldableBody(displayedBody, documentBodyContentClassName, externalReferences)
                       ) : activeDraft ? (
                         <MarkdownEditor
@@ -1431,7 +1436,7 @@ function AccountIssueDocumentsSection({
                         renderFoldableBody(displayedBody, documentBodyContentClassName, externalReferences)
                       );
 
-                      return documentSubject.annotations ? (
+                      return documentSubject.annotations && (!waitingForLinkedRevision || activeDraft) ? (
                         <IssueDocumentAnnotations
                           issueId={documentSubject.annotations.issueId}
                           target={annotationTarget}

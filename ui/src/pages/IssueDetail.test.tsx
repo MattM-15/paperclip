@@ -1550,6 +1550,7 @@ describe("IssueDetail", () => {
     await act(async () => renderIssueView());
     await flushReact();
     expect(mockIssueChatThreadRender).not.toHaveBeenCalled();
+    expect(container.querySelector('[data-testid="issue-detail-header"]')?.textContent).toContain(createIssue().title);
     coordinatorPreference.loaded = true;
     await act(async () => renderIssueView());
     await waitForAssertion(() => expect(mockIssueChatThreadRender).toHaveBeenCalled());

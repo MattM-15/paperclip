@@ -802,7 +802,7 @@ export function App() {
         <Route path="ux-lab/cross-issue-collaboration" element={<CrossIssueCollaborationUxLab />} />
 
         <Route element={<CloudAccessGate />}>
-          <Route element={<ShellConfigurationGate loaded={streamlinedUiLoaded} />}>
+          <Route element={<ShellConfigurationGate loaded={streamlinedUiLoaded} allowPendingTaskDetail={classicStreamlinedUiLoaded && !coordinatorWorkspaceLoaded} />}>
           <Route index element={<CompanyRootRedirect />} />
           <Route path="onboarding" element={<OnboardingRoutePage />} />
           <Route path="instance" element={<LegacySettingsRedirect />} />
