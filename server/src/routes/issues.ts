@@ -276,7 +276,10 @@ import {
 } from "../attachment-types.js";
 import { retainBacklogHumanAssignment } from "../services/human-directed-work.js";
 import { queueIssueAssignmentWakeup } from "../services/issue-assignment-wakeup.js";
-import { shouldWakeAssigneeForIssueComment } from "../services/issue-comment-wakeup.js";
+import {
+  buildIssueCommentWakeIdempotencyKey,
+  shouldWakeAssigneeForIssueComment,
+} from "../services/issue-comment-wakeup.js";
 import { createSecretProposalsService } from "../services/secret-proposals.js";
 import { notifySecretProposalResolution } from "../services/secret-proposal-notifications.js";
 import {
@@ -19107,14 +19110,30 @@ export function issueRoutes(
           })
         : null;
       if (agentCreatedIssueCommentReceipt && createdCommentReceipt === false) {
-        await externalObjectsSvc.syncCommentSafely(comment.id);
-        res.status(201).json(comment);
-        return;
+        const assigneeId = currentIssue.assigneeAgentId;
+        const shouldRecoverWake = Boolean(
+          assigneeId &&
+            actor.actorId !== assigneeId &&
+            shouldWakeAssigneeForIssueComment({
+              selfComment: false,
+              resumeRequested: false,
+              commentCreatedByRunId: comment.createdByRunId,
+              issueAtCommentStart: issue,
+              reopened: false,
+              currentStatus: currentIssue.status,
+            }),
+        );
+        if (!shouldRecoverWake) {
+          await externalObjectsSvc.syncCommentSafely(comment.id);
+          res.status(201).json(comment);
+          return;
+        }
       }
       if (!keyedComment) await issueReferencesSvc.syncComment(comment.id);
       await externalObjectsSvc.syncCommentSafely(comment.id);
       if (
         currentIssue.assigneeAgentId &&
+        !agentCreatedIssueCommentReceipt &&
         // Slack-linked messages need the normal attributed wake boundary so
         // the accepted requester and return-thread receipt travel with the run.
         !currentIssue.externalConversationState &&
@@ -19123,39 +19142,46 @@ export function issueRoutes(
           actor.actorId === currentIssue.assigneeAgentId
         )
       ) {
-        const goalProjection = await runnerGoals.projection(
-          currentIssue.companyId,
-          currentIssue.id,
-          currentIssue.assigneeAgentId,
-        );
-        if (
-          goalProjection?.goal?.status === "active" &&
-          goalProjection.workingNow
-        ) {
-          const steer = queueLiveRunnerPrpCommand({
-            companyId: currentIssue.companyId,
-            issueId: currentIssue.id,
-            agentId: currentIssue.assigneeAgentId,
-            type: "turn.steer",
-            payload: { text: comment.body },
-            commandId: `goal_comment_${comment.id}`,
-          });
-          if (steer) {
-            try {
-              await steer.completion;
-              goalCommentSteered = true;
-            } catch (err) {
-              logger.warn(
-                {
-                  err,
-                  issueId: currentIssue.id,
-                  commentId: comment.id,
-                  runId: steer.runId,
-                },
-                "failed to steer an active session goal; falling back to a boundary wake",
-              );
+        try {
+          const goalProjection = await runnerGoals.projection(
+            currentIssue.companyId,
+            currentIssue.id,
+            currentIssue.assigneeAgentId,
+          );
+          if (
+            goalProjection?.goal?.status === "active" &&
+            goalProjection.workingNow
+          ) {
+            const steer = queueLiveRunnerPrpCommand({
+              companyId: currentIssue.companyId,
+              issueId: currentIssue.id,
+              agentId: currentIssue.assigneeAgentId,
+              type: "turn.steer",
+              payload: { text: comment.body },
+              commandId: `goal_comment_${comment.id}`,
+            });
+            if (steer) {
+              try {
+                await steer.completion;
+                goalCommentSteered = true;
+              } catch (err) {
+                logger.warn(
+                  {
+                    err,
+                    issueId: currentIssue.id,
+                    commentId: comment.id,
+                    runId: steer.runId,
+                  },
+                  "failed to steer an active session goal; falling back to a boundary wake",
+                );
+              }
             }
           }
+        } catch (err) {
+          logger.warn(
+            { err, issueId: currentIssue.id, commentId: comment.id },
+            "failed to project an active session goal; falling back to a boundary wake",
+          );
         }
       }
 
@@ -19230,7 +19256,7 @@ export function issueRoutes(
       });
 
       // Merge all wakeups from this comment into one enqueue per agent to avoid duplicate runs.
-      void (async () => {
+      const dispatchCommentWakeups = (async () => {
         type WakeupRequest = NonNullable<
           Parameters<typeof heartbeat.wakeup>[1]
         >;
@@ -19349,6 +19375,10 @@ export function issueRoutes(
               source: "automation",
               triggerDetail: "system",
               reason: "issue_reopened_via_comment",
+              idempotencyKey: buildIssueCommentWakeIdempotencyKey(
+                comment.id,
+                assigneeId,
+              ),
               payload: {
                 issueId: currentIssue.id,
                 commentId: comment.id,
@@ -19380,6 +19410,10 @@ export function issueRoutes(
               source: "automation",
               triggerDetail: "system",
               reason: "issue_commented",
+              idempotencyKey: buildIssueCommentWakeIdempotencyKey(
+                comment.id,
+                assigneeId,
+              ),
               payload: {
                 issueId: currentIssue.id,
                 commentId: comment.id,
@@ -19491,10 +19525,10 @@ export function issueRoutes(
           }
         }
 
-        for (const { agentId, wakeup } of wakeups.values()) {
-          heartbeat
-            .wakeup(agentId, wakeup)
-            .then((wakeRun) => {
+        await Promise.all(
+          [...wakeups.values()].map(async ({ agentId, wakeup }) => {
+            try {
+              const wakeRun = await heartbeat.wakeup(agentId, wakeup);
               if (wakeup.reason !== ISSUE_BLOCKERS_RESOLVED_WAKE_REASON) return;
               const payload =
                 wakeup.payload && typeof wakeup.payload === "object"
@@ -19504,7 +19538,7 @@ export function issueRoutes(
                 typeof payload.issueId === "string"
                   ? payload.issueId
                   : currentIssue.id;
-              return logActivity(db, {
+              await logActivity(db, {
                 companyId: currentIssue.companyId,
                 actorType: "system",
                 actorId: "issue_comment",
@@ -19527,15 +19561,18 @@ export function issueRoutes(
                     : [],
                 },
               });
-            })
-            .catch((err) =>
+            } catch (err) {
               logger.warn(
                 { err, issueId: currentIssue.id, agentId },
                 "failed to wake agent on issue comment",
-              ),
-            );
-        }
+              );
+              if (agentCreatedIssueCommentReceipt) throw err;
+            }
+          }),
+        );
       })();
+      if (agentCreatedIssueCommentReceipt) await dispatchCommentWakeups;
+      else void dispatchCommentWakeups;
 
 
       await queueTaskWatchdogEvaluation(currentIssue, actor.runId);

@@ -349,16 +349,20 @@ describeEmbeddedPostgres("issue comment attribution and patch audit routes", () 
       presentation: null,
     });
     await vi.waitFor(() => expect(mockHeartbeat.wakeup).toHaveBeenCalledTimes(1));
+    const wakeOptions = mockHeartbeat.wakeup.mock.calls[0]![1];
 
     const replay = await request(app).post(`/api/issues/${fixture.issue.id}/comments`).send(input);
     expect(replay.status, JSON.stringify(replay.body)).toBe(201);
     expect(replay.body.id).toBe(first.body.id);
-    expect(mockHeartbeat.wakeup).toHaveBeenCalledTimes(1);
+    expect(mockHeartbeat.wakeup).toHaveBeenCalledTimes(2);
     expect(await db.select().from(issueComments)).toHaveLength(1);
     expect(await db.select().from(activityLog).where(and(
       eq(activityLog.entityId, fixture.issue.id),
       eq(activityLog.action, "issue.comment_added"),
     ))).toHaveLength(1);
+    expect(wakeOptions.idempotencyKey).toBe(
+      `issue-comment:${first.body.id}:${fixture.targetAgent.id}`,
+    );
 
     const changed = await request(app).post(`/api/issues/${fixture.issue.id}/comments`)
       .send({ ...input, body: "Changed content for the same receipt" });
@@ -397,6 +401,61 @@ describeEmbeddedPostgres("issue comment attribution and patch audit routes", () 
     expect(mockExternalObjects.syncCommentSafely).toHaveBeenCalledWith(retry.body.id);
   }, 30_000);
 
+  it("accepts a durable no-run comment when the assignee wake is policy-refused", async () => {
+    const fixture = await seed();
+    await db.update(issues).set({
+      status: "todo",
+      createdByAgentId: fixture.actorAgent.id,
+      createdByUserId: null,
+    }).where(eq(issues.id, fixture.issue.id));
+    await db.update(agents).set({ status: "paused" }).where(eq(agents.id, fixture.targetAgent.id));
+    const app = await createApp(db, noRunAgentActor(fixture));
+
+    const response = await request(app)
+      .post(`/api/issues/${fixture.issue.id}/comments`)
+      .send({ body: "Persist while the assignee is paused", clientRequestId: randomUUID() });
+
+    expect(response.status, JSON.stringify(response.body)).toBe(201);
+    expect(await db.select().from(issueComments)).toHaveLength(1);
+    expect(mockHeartbeat.wakeup).toHaveBeenCalledTimes(1);
+  }, 30_000);
+
+  it("retries a committed receipt when durable wake admission fails", async () => {
+    const fixture = await seed();
+    await db.update(issues).set({
+      status: "todo",
+      createdByAgentId: fixture.actorAgent.id,
+      createdByUserId: null,
+    }).where(eq(issues.id, fixture.issue.id));
+    const app = await createApp(db, noRunAgentActor(fixture));
+    const input = {
+      body: "Recover the comment wake after admission fails",
+      clientRequestId: randomUUID(),
+    };
+    mockHeartbeat.wakeup.mockRejectedValueOnce(new Error("wake admission failed"));
+
+    const failed = await request(app)
+      .post(`/api/issues/${fixture.issue.id}/comments`)
+      .send(input);
+    expect(failed.status).toBe(500);
+    expect(await db.select().from(issueComments)).toHaveLength(1);
+    expect(await db.select().from(activityLog).where(and(
+      eq(activityLog.entityId, fixture.issue.id),
+      eq(activityLog.action, "issue.comment_added"),
+    ))).toHaveLength(1);
+
+    const retry = await request(app)
+      .post(`/api/issues/${fixture.issue.id}/comments`)
+      .send(input);
+    expect(retry.status, JSON.stringify(retry.body)).toBe(201);
+    expect(mockHeartbeat.wakeup).toHaveBeenCalledTimes(2);
+    expect(mockHeartbeat.wakeup.mock.calls.map((call) => call[1]?.idempotencyKey))
+      .toEqual([
+        `issue-comment:${retry.body.id}:${fixture.targetAgent.id}`,
+        `issue-comment:${retry.body.id}:${fixture.targetAgent.id}`,
+      ]);
+  }, 30_000);
+
   it("wakes only the replay that finalizes receipt activity before the original request", async () => {
     const fixture = await seed();
     await db.update(issues).set({
@@ -428,13 +487,18 @@ describeEmbeddedPostgres("issue comment attribution and patch audit routes", () 
     expect(replay.status, JSON.stringify(replay.body)).toBe(201);
     expect(originalResponse.status, JSON.stringify(originalResponse.body)).toBe(201);
     expect(originalResponse.body.id).toBe(replay.body.id);
-    await vi.waitFor(() => expect(mockHeartbeat.wakeup).toHaveBeenCalledTimes(1));
+    await vi.waitFor(() => expect(mockHeartbeat.wakeup).toHaveBeenCalledTimes(2));
     expect(await db.select().from(issueComments)).toHaveLength(1);
     expect(await db.select().from(activityLog).where(and(
       eq(activityLog.entityId, fixture.issue.id),
       eq(activityLog.action, "issue.comment_added"),
     ))).toHaveLength(1);
-    expect(mockHeartbeat.wakeup).toHaveBeenCalledTimes(1);
+    expect(mockHeartbeat.wakeup).toHaveBeenCalledTimes(2);
+    expect(mockHeartbeat.wakeup.mock.calls.map((call) => call[1]?.idempotencyKey))
+      .toEqual([
+        `issue-comment:${replay.body.id}:${fixture.targetAgent.id}`,
+        `issue-comment:${replay.body.id}:${fixture.targetAgent.id}`,
+      ]);
   }, 30_000);
 
   it("keeps no-run comments and updates denied for non-creators and other companies", async () => {
@@ -492,7 +556,7 @@ describeEmbeddedPostgres("issue comment attribution and patch audit routes", () 
     expect(mockHeartbeat.wakeup).not.toHaveBeenCalled();
   }, 30_000);
 
-  it("leaves one comment, activity, and wake after concurrent creator retries", async () => {
+  it("leaves one comment and activity across concurrent creator retries", async () => {
     const fixture = await seed();
     await db.update(issues).set({
       status: "todo",
@@ -509,14 +573,16 @@ describeEmbeddedPostgres("issue comment attribution and patch audit routes", () 
       expect(response.status, JSON.stringify(response.body)).toBe(201);
       expect(response.body.id).toBe(responses[0]!.body.id);
     }
-    await vi.waitFor(() => expect(mockHeartbeat.wakeup).toHaveBeenCalledTimes(1));
-
     expect(await db.select().from(issueComments)).toHaveLength(1);
     expect(await db.select().from(activityLog).where(and(
       eq(activityLog.entityId, fixture.issue.id),
       eq(activityLog.action, "issue.comment_added"),
     ))).toHaveLength(1);
-    expect(mockHeartbeat.wakeup).toHaveBeenCalledTimes(1);
+    expect(mockHeartbeat.wakeup).toHaveBeenCalledTimes(4);
+    expect(new Set(mockHeartbeat.wakeup.mock.calls.map((call) => call[1]?.idempotencyKey)))
+      .toEqual(new Set([
+        `issue-comment:${responses[0]!.body.id}:${fixture.targetAgent.id}`,
+      ]));
   }, 30_000);
 
   it("rejects and audits an agent-supplied onBehalfOfUserId", async () => {
