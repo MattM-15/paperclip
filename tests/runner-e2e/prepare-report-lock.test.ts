@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { expect, it } from 'vitest';
 import { parse } from 'yaml';
-import { prepareReportLock } from './prepare-report-lock.mjs';
+import { prepareReportLock, refreshReportLock } from './prepare-report-lock.mjs';
 
 it.each(['valid', 'unknown-lock', 'changed-patch', 'wrong-output'])(
   'installs only the reviewed dependency correction: %s', async variant => {
@@ -39,9 +39,12 @@ it.each(['valid', 'unknown-lock', 'changed-patch', 'wrong-output'])(
         expect(await prepareReportLock(root)).toBe('already-reviewed');
         const before = parse(input.toString()).packages;
         const after = parse(await readFile(lock, 'utf8')).packages;
-        expect(Object.keys(after).filter(key => !Object.hasOwn(before, key))).toEqual(['yaml@2.9.1']);
-        for (const [key, value] of Object.entries(before)) expect(after[key]).toEqual(value);
-        expect(after['yaml@2.9.1'].resolution.integrity).toBe('sha512-3NxN8+78OdzbT7C/WjGsyfPAtJaN3FNDsWxv7Y7mcDsT/oOmgW8BpyQQFFBnvZE3j9Y2Sdz1ULFLezL7Eb2yFw==');
+        expect(after).toEqual(before);
+        const reviewed = parse(await readFile(lock, 'utf8'));
+        const ui = JSON.parse(await readFile(path.resolve(here, '../../ui/package.json'), 'utf8'));
+        for (const [name, specifier] of Object.entries(ui.dependencies)) {
+          expect(reviewed.importers.ui.dependencies[name].specifier).toBe(specifier);
+        }
 
       } else {
         await expect(prepareReportLock(root)).rejects.toThrow();
@@ -50,3 +53,43 @@ it.each(['valid', 'unknown-lock', 'changed-patch', 'wrong-output'])(
     } finally { await rm(root, { recursive: true, force: true }); }
   },
 );
+
+
+it.each(['reviewed', 'unknown'])('refreshes dependency proof only from a %s committed lock', async variant => {
+  const root = await mkdtemp(path.join(tmpdir(), 'eval-report-lock-refresh-'));
+  const relative = path.join(root, 'tests/runner-e2e');
+  const original = "lockfileVersion: '9.0'\nimporters: {}\n";
+  const resolved = "lockfileVersion: '9.0'\nimporters:\n  ui: {}\n";
+  const hash = (value: string) => createHash('sha256').update(value).digest('hex');
+  try {
+    await mkdir(relative, { recursive: true });
+    await writeFile(path.join(root, 'pnpm-lock.yaml'), original);
+    const initial = { inputSha256: variant === 'reviewed' ? hash(original) : '0'.repeat(64),
+      outputSha256: variant === 'reviewed' ? hash(original) : '1'.repeat(64), patchSha256: hash('historical') };
+    await writeFile(path.join(relative, 'report-lock.json'), JSON.stringify(initial));
+    await writeFile(path.join(relative, 'report-lock.patch'), 'historical');
+    execFileSync('git', ['init', '-q'], { cwd: root });
+    execFileSync('git', ['add', '.'], { cwd: root });
+    execFileSync('git', ['-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '-qm', 'fixture'], { cwd: root });
+    await writeFile(path.join(root, 'pnpm-lock.yaml'), resolved);
+    if (variant === 'unknown') {
+      await expect(refreshReportLock(root)).rejects.toThrow('not reviewed');
+      expect(await readFile(path.join(relative, 'report-lock.patch'), 'utf8')).toBe('historical');
+      expect(JSON.parse(await readFile(path.join(relative, 'report-lock.json'), 'utf8'))).toEqual(initial);
+      expect(await readFile(path.join(root, 'pnpm-lock.yaml'), 'utf8')).toBe(resolved);
+      return;
+    }
+    expect(await refreshReportLock(root)).toBe('refreshed');
+    const policy = JSON.parse(await readFile(path.join(relative, 'report-lock.json'), 'utf8'));
+    const patch = await readFile(path.join(relative, 'report-lock.patch'), 'utf8');
+    expect(policy).toMatchObject({ inputSha256: hash(original), outputSha256: hash(resolved), patchSha256: hash(patch) });
+    await writeFile(path.join(root, 'pnpm-lock.yaml'), original);
+    expect(await prepareReportLock(root)).toBe('reviewed-correction');
+    expect(await readFile(path.join(root, 'pnpm-lock.yaml'), 'utf8')).toBe(resolved);
+    expect(await prepareReportLock(root)).toBe('already-reviewed');
+    execFileSync('git', ['add', '.'], { cwd: root });
+    execFileSync('git', ['-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '-qm', 'refresh'], { cwd: root });
+    expect(await refreshReportLock(root)).toBe('unchanged');
+    expect(await readFile(path.join(relative, 'report-lock.patch'), 'utf8')).toBe(patch);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});

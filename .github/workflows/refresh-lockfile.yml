@@ -39,6 +39,9 @@ jobs:
       - name: Refresh pnpm lockfile
         run: pnpm install --resolution-only --ignore-scripts --no-frozen-lockfile
 
+      - name: Refresh reviewed eval report dependency proof
+        run: node tests/runner-e2e/prepare-report-lock.mjs --refresh
+
       - name: Fail on unexpected file changes
         run: |
           changed="$(git status --porcelain)"
@@ -46,7 +49,8 @@ jobs:
             echo "Lockfile is already up to date."
             exit 0
           fi
-          if printf '%s\n' "$changed" | grep -Fvq ' pnpm-lock.yaml'; then
+          unexpected="$(printf '%s\n' "$changed" | awk '$2 != "pnpm-lock.yaml" && $2 != "tests/runner-e2e/report-lock.json" && $2 != "tests/runner-e2e/report-lock.patch" { print }')"
+          if [ -n "$unexpected" ]; then
             echo "Unexpected files changed during lockfile refresh:"
             echo "$changed"
             exit 1
@@ -69,7 +73,7 @@ jobs:
           git config user.email "lockfile-bot@users.noreply.github.com"
 
           git checkout -B "$BRANCH"
-          git add pnpm-lock.yaml
+          git add pnpm-lock.yaml tests/runner-e2e/report-lock.json tests/runner-e2e/report-lock.patch
           git commit -m "chore(lockfile): refresh pnpm-lock.yaml"
           git push --force origin "$BRANCH"
 
@@ -79,13 +83,15 @@ jobs:
               --jq ".[] | select(.headRepositoryOwner.login == \"$REPO_OWNER\") | .url" |
             head -n 1
           )"
+          pr_body="Auto-generated lockfile refresh after dependencies changed on master. Includes the matching offline eval report correction and its reviewed hashes."
           if [ -z "$pr_url" ]; then
             pr_url="$(gh pr create \
               --head "$BRANCH" \
               --title "chore(lockfile): refresh pnpm-lock.yaml" \
-              --body "Auto-generated lockfile refresh after dependencies changed on master. This PR only updates pnpm-lock.yaml.")"
+              --body "$pr_body")"
             echo "Created new PR: $pr_url"
           else
+            gh pr edit "$pr_url" --body "$pr_body"
             echo "PR already exists: $pr_url"
           fi
           echo "pr_url=$pr_url" >> "$GITHUB_OUTPUT"
