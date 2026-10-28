@@ -332,7 +332,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     vi.stubEnv("PAPERCLIP_MANAGED_CONFIG", "{}");
     const pluginId = randomUUID();
     const { companyId, environment: baseEnvironment, runId } = await seedEnvironment();
-    const config = { provider: "daytona", snapshot: "replacement-snapshot" };
+    const config = { provider: "daytona", snapshot: "replacement-snapshot", timeoutMs: 1234 };
     await insertSandboxProviderPlugin(pluginId, { environmentDrivers: [{ driverKey: "daytona", kind: "sandbox_provider", displayName: "Daytona", configSchema: { type: "object" } }] });
     const fingerprint = createHash("sha256").update(stableStringify(config)).digest("hex");
     const parsed = await resolveEnvironmentDriverConfigForRuntime(db, companyId, { ...baseEnvironment, driver: "sandbox", config });
