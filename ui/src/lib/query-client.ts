@@ -24,6 +24,9 @@ import {
   type Mutation,
   type MutationOptions,
   type QueryClientConfig,
+  type QueryKey,
+  type RefetchOptions,
+  type RefetchQueryFilters,
 } from "@tanstack/react-query";
 import { classifyError, describeError, errorRetryAfterMs, isTransientError } from "@/api/errors";
 import { MAX_PROBE_DELAY_MS, PROBE_BACKOFF_MS, type ConnectivityStore } from "./connectivity";
@@ -143,6 +146,27 @@ class AppQueryClient extends QueryClient {
       retry: options?.retry ?? shouldRetryRequest,
       retryDelay: options?.retryDelay ?? retryDelayFor,
     };
+  }
+
+  /**
+   * Skip cache-only entries. A `setQueryData` alias (one task cached under its
+   * UUID and its identifier) has no `queryFn` until a view observes it, so a
+   * refetch can only fail with "Missing queryFn". `invalidateQueries` still
+   * marks it stale, and the next view that mounts it fetches with its own
+   * `queryFn`.
+   */
+  override refetchQueries<TTaggedQueryKey extends QueryKey = QueryKey>(
+    filters?: RefetchQueryFilters<TTaggedQueryKey>,
+    options?: RefetchOptions,
+  ): Promise<void> {
+    const predicate = filters?.predicate;
+    return super.refetchQueries(
+      {
+        ...filters,
+        predicate: (query) => query.options.queryFn !== undefined && (predicate?.(query) ?? true),
+      },
+      options,
+    );
   }
 }
 
