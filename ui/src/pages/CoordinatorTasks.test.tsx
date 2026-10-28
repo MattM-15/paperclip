@@ -8,8 +8,10 @@ import { createIssue } from "../../storybook/fixtures/paperclipData";
 import { coordinatorAttentionQueryKey } from "@/lib/coordinator-attention";
 import { MemoryRouter } from "@/lib/router";
 import { CoordinatorTasks } from "./CoordinatorTasks";
+import { queryKeys } from "@/lib/queryKeys";
 
-const mocks = vi.hoisted(() => ({ list: vi.fn(), get: vi.fn(), attention: vi.fn(), breadcrumbs: vi.fn() }));
+const mocks = vi.hoisted(() => ({ list: vi.fn(), get: vi.fn(), attention: vi.fn(), breadcrumbs: vi.fn(), liveRuns: vi.fn() }));
+vi.mock("@/api/heartbeats", () => ({ heartbeatsApi: { liveRunsForCompany: mocks.liveRuns } }));
 vi.mock("@/api/issues", () => ({ issuesApi: { list: mocks.list, get: mocks.get, listLabels: async () => [], update: vi.fn() } }));
 vi.mock("@/api/attention", () => ({ attentionApi: { list: mocks.attention } }));
 vi.mock("@/api/agents", () => ({ agentsApi: { list: async () => [] } }));
@@ -19,7 +21,7 @@ vi.mock("@/api/companies-query", () => ({ useAccountIdentity: () => ({ userId: "
 vi.mock("@/context/CompanyContext", () => ({ useCompany: () => ({ selectedCompanyId: "company" }) }));
 vi.mock("@/context/DialogContext", () => ({ useDialogActions: () => ({ openNewIssue: vi.fn() }) }));
 vi.mock("@/context/BreadcrumbContext", () => ({ useBreadcrumbs: () => ({ setBreadcrumbs: mocks.breadcrumbs }) }));
-vi.mock("@/components/TaskListToolbar", () => ({ TaskListToolbar: () => null }));
+vi.mock("@/components/TaskListToolbar", () => ({ TaskListToolbar: ({ filters }: { filters: { onChange: (value: { liveOnly: boolean }) => void } }) => <button onClick={() => filters.onChange({ liveOnly: true })}>Live runs only</button> }));
 vi.mock("@/components/KanbanBoard", () => ({ KanbanBoard: () => null }));
 vi.mock("@/components/TaskList", async importOriginal => ({
   ...await importOriginal<typeof import("@/components/TaskList")>(),
@@ -33,6 +35,7 @@ describe("Coordinator tasks using the proposed table", () => {
   const decision = { subject: { kind: "interaction", id: "question" }, relatedIssue: { id: pending.id } } as AttentionItem;
   beforeEach(() => {
     vi.clearAllMocks(); localStorage.clear();
+    mocks.liveRuns.mockResolvedValue([]);
     mocks.attention.mockResolvedValue({ items: [decision, { ...decision, subject: { kind: "interaction", id: "approval" } }] });
     mocks.get.mockResolvedValue(pending);
     mocks.list.mockResolvedValue([createIssue({ id: "unrelated-review", companyId: "company", status: "in_review", parentId: null })]);
@@ -55,6 +58,21 @@ describe("Coordinator tasks using the proposed table", () => {
     await vi.waitFor(() => expect(host.querySelectorAll("[data-task-id]")).toHaveLength(1));
     flushSync(() => client.setQueryData(coordinatorAttentionQueryKey("company"), { items: [] }));
     await vi.waitFor(() => expect(host.textContent).toContain("No tasks need a decision."));
+  });
+  it("filters live tasks and updates when a run finishes, excluding terminal tasks with stale runs", async () => {
+    mocks.list.mockResolvedValue([
+      createIssue({ id: "live", companyId: "company", status: "in_progress", parentId: null }),
+      createIssue({ id: "idle", companyId: "company", status: "todo", parentId: null }),
+      createIssue({ id: "done", companyId: "company", status: "done", parentId: null }),
+    ]);
+    mocks.liveRuns.mockResolvedValue([{ issueId: "live", status: "running" }, { issueId: "done", status: "running" }]);
+    await mount("/issues");
+    await vi.waitFor(() => expect(mocks.liveRuns).toHaveBeenCalledWith("company"));
+    flushSync(() => Array.from(host.querySelectorAll("button")).find(button => button.textContent === "Live runs only")!.click());
+    await vi.waitFor(() => expect([...host.querySelectorAll("[data-task-id]")].map(node => node.getAttribute("data-task-id"))).toEqual(["live"]));
+    flushSync(() => client.setQueryData(queryKeys.liveRuns("company"), []));
+    await vi.waitFor(() => expect(host.querySelectorAll("[data-task-id]")).toHaveLength(0));
+    expect(host.textContent).toContain("No tasks match this view");
   });
   it("preserves server search and scoped task links rather than searching only the first page", async () => {
     mocks.list.mockResolvedValue([createIssue({ id: "search-result", companyId: "company", parentId: null, description: "launch description" })]);

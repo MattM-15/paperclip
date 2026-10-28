@@ -8,7 +8,7 @@ const expanded: ReadonlySet<string> = new Set();
 
 /** Shared collection behavior for the proposed task UI. Supply accessible data;
  * this hook scopes presentation, and does not replace server authorization. */
-export function useTaskListCollection({ items, companyId, userId, viewStorageKey, initialQuery = "", query: controlledQuery, onQueryChange, view: controlledView, initialFilters, searchMode = "local" }: {
+export function useTaskListCollection({ items, companyId, userId, viewStorageKey, initialQuery = "", query: controlledQuery, onQueryChange, view: controlledView, initialFilters, searchMode = "local", liveIssueIds }: {
   items: readonly TaskListItem[];
   companyId: string | null;
   userId: string | null;
@@ -20,6 +20,7 @@ export function useTaskListCollection({ items, companyId, userId, viewStorageKey
   initialFilters?: Partial<IssueFilterState>;
   /** Server results may match comments, documents, or normalized identifiers. */
   searchMode?: "local" | "server";
+  liveIssueIds?: ReadonlySet<string>;
 }) {
   const [queryState, setQueryState] = useState(initialQuery);
   const query = controlledQuery ?? queryState;
@@ -42,7 +43,7 @@ export function useTaskListCollection({ items, companyId, userId, viewStorageKey
     const id = `${kind}:${rawId}`;
     creatorsById.set(id, { id, kind, label: item.createdBy || rawId });
   }
-  const filteredIds = new Set(applyIssueFilters(companyItems.map(item => item.issue), filters, userId).map(issue => issue.id));
+  const filteredIds = new Set(applyIssueFilters(companyItems.map(item => item.issue), filters, userId, false, liveIssueIds).map(issue => issue.id));
   const normalizedQuery = query.trim().toLocaleLowerCase();
   const matchingItems = companyItems.filter(item => filteredIds.has(item.issue.id)
     && matchesTaskListView(view, item.issue, Boolean(item.unread), userId)

@@ -4,6 +4,7 @@ import { ListChecks, SearchX } from "lucide-react";
 import { accessApi } from "@/api/access";
 import { agentsApi } from "@/api/agents";
 import { attentionApi } from "@/api/attention";
+import { heartbeatsApi } from "@/api/heartbeats";
 import { useAccountIdentity } from "@/api/companies-query";
 import { issuesApi } from "@/api/issues";
 import { projectsApi } from "@/api/projects";
@@ -18,6 +19,8 @@ import { useBreadcrumbs } from "@/context/BreadcrumbContext";
 import { useCompany } from "@/context/CompanyContext";
 import { useDialogActions } from "@/context/DialogContext";
 import { useTaskListCollection } from "@/hooks/useTaskListCollection";
+import { usePublishSharedQueryData, useSharedPollingQuery } from "@/hooks/useSharedPolling";
+import { collectLiveIssueIds } from "@/lib/liveIssueIds";
 import { buildCompanyUserLabelMap } from "@/lib/company-members";
 import { coordinatorAttentionQueryKey, pendingDecisionTaskIds } from "@/lib/coordinator-attention";
 import { createIssueDetailLocationState } from "@/lib/issueDetailBreadcrumb";
@@ -78,6 +81,9 @@ export function CoordinatorTasks() {
   const projects = useQuery({ queryKey: queryKeys.projects.list(companyId!, { includeArchived: true }), queryFn: () => projectsApi.list(companyId!, { includeArchived: true }), enabled: !!companyId });
   const directory = useQuery({ queryKey: queryKeys.access.companyUserDirectory(companyId!), queryFn: () => accessApi.listUserDirectory(companyId!), enabled: !!companyId });
   const labels = useQuery({ queryKey: queryKeys.issues.labels(companyId!), queryFn: () => issuesApi.listLabels(companyId!), enabled: !!companyId });
+  const sharedLiveRuns = useSharedPollingQuery({ companyId, resourceKey: "live-runs", queryKey: queryKeys.liveRuns(companyId!), enabled: !!companyId, refetchInterval: false, leaderOnly: true });
+  const liveRuns = useQuery({ queryKey: queryKeys.liveRuns(companyId!), queryFn: () => heartbeatsApi.liveRunsForCompany(companyId!), enabled: sharedLiveRuns.enabled, refetchInterval: sharedLiveRuns.refetchInterval });
+  usePublishSharedQueryData(sharedLiveRuns, liveRuns.data, liveRuns.dataUpdatedAt);
   const users = buildCompanyUserLabelMap(directory.data?.users);
   const agentNames = new Map(agents.data?.map(agent => [agent.id, agent.name]));
   const projectById = new Map(projects.data?.map(project => [project.id, project]));
@@ -89,6 +95,7 @@ export function CoordinatorTasks() {
   }));
   const collection = useTaskListCollection({ items, companyId, userId, query, onQueryChange: setQuery, view: "all",
     searchMode: needsAttention ? "local" : "server",
+    liveIssueIds: collectLiveIssueIds(liveRuns.data, records),
     viewStorageKey: taskListViewStorageKey("coordinator", userId ?? "local-board"),
     initialFilters: { assignees: params.get("assignee") ? [params.get("assignee")!] : [] },
   });
@@ -96,8 +103,10 @@ export function CoordinatorTasks() {
     onSuccess: () => { void client.invalidateQueries({ queryKey: queryKeys.issues.list(companyId!) }); void client.invalidateQueries({ queryKey: coordinatorAttentionQueryKey(companyId!) }); },
   });
   const error = (needsAttention ? attention.error ?? attentionTasks.find(task => task.error)?.error : tasks.error)
-    ?? agents.error ?? projects.error ?? directory.error ?? labels.error ?? update.error;
-  const pending = needsAttention ? attention.isPending || attentionTasks.some(task => task.isPending) : tasks.isPending;
+    ?? agents.error ?? projects.error ?? directory.error ?? labels.error ?? update.error
+    ?? (collection.filters.liveOnly ? liveRuns.error : null);
+  const pending = (needsAttention ? attention.isPending || attentionTasks.some(task => task.isPending) : tasks.isPending)
+    || (collection.filters.liveOnly && liveRuns.isPending);
   const empty = <EmptyState icon={query || collection.activeFilterCount ? SearchX : ListChecks}
     message={query || collection.activeFilterCount ? "No tasks match this view" : needsAttention ? "No tasks need a decision." : "No tasks in this organization"}
     action={query || collection.activeFilterCount ? "Clear filters" : needsAttention ? undefined : "New Task"}
@@ -108,6 +117,7 @@ export function CoordinatorTasks() {
     void (needsAttention ? attention.refetch() : tasks.refetch());
     for (const task of attentionTasks) void task.refetch();
     void agents.refetch(); void projects.refetch(); void directory.refetch(); void labels.refetch();
+    if (collection.filters.liveOnly) void liveRuns.refetch();
   };
 
   if (!companyId) return <EmptyState icon={ListChecks} message="Select an organization to view tasks." />;

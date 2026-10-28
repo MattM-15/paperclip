@@ -33,6 +33,14 @@ beforeEach(() => {
 afterEach(() => { act(() => root.unmount()); host.remove(); localStorage.clear(); });
 
 describe("shared task-list collection behavior", () => {
+  it("uses current live IDs for matching while retaining ancestor context", () => {
+    render({ liveIssueIds: new Set(["child", "foreign"]) });
+    act(() => collection.updateFilters({ liveOnly: true }));
+    expect(collection.matchingItems.map(item => item.issue.id)).toEqual(["child"]);
+    expect(collection.visibleItems.map(item => item.issue.id)).toEqual(["parent", "child"]);
+    render({ liveIssueIds: new Set() });
+    expect(collection.matchingItems).toEqual([]);
+  });
   it("distinguishes human and agent creators with the same raw ID and excludes other companies", () => {
     expect(collection.creators).toEqual([
       { id: "user:same", label: "Scott", kind: "user" },
