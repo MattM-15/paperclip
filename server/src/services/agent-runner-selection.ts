@@ -11,11 +11,13 @@ import { runSshCommand } from "@paperclipai/adapter-utils/ssh";
 import { parseEnvironmentDriverConfig, resolveEnvironmentDriverConfigForRuntime } from "./environment-config.js";
 import { localAgentRunnerTarget } from "../lib/agent-runner-platform.js";
 import { normalizeClaudeRunnerOptions, type AgentConfigurationWarning } from "@paperclipai/shared";
+import { usesManagedCloudSandboxImage } from "./sandbox-snapshot-qualification.js";
 
 export type RunnerTarget = {
   driver: string; platform?: string; architecture?: string; libc?: "glibc" | "musl" | "unknown"; glibcVersion?: string;
   /** A plugin environment whose driver declares Runner task execution. It runs agents only through Paperclip Runner. */
   runnerTasks?: boolean;
+  managedCloudImage?: boolean;
   warmTaskVersion?: 1;
 };
 export const AGENT_RUNNER_SSH_PLATFORM_COMMAND = "uname -s; uname -m; if paperclip_glibc_version=$(getconf GNU_LIBC_VERSION 2>/dev/null) && [ -n \"$paperclip_glibc_version\" ]; then printf 'glibc\\n%s\\n' \"$paperclip_glibc_version\"; else case \"$(ldd --version 2>&1)\" in *musl*) printf 'musl\\n' ;; *) printf 'unknown\\n' ;; esac; fi";
@@ -39,12 +41,9 @@ function runnerAdaptersAvailable(harness: string, driver: string): boolean {
 }
 
 export function agentRunnerAvailability(harness: string, target: RunnerTarget = localAgentRunnerTarget()): AgentRunnerAvailability {
-  if (target.runnerTasks) {
-    // The plugin provisions the host and launches its own pinned Runner, so
-    // Core has no platform to qualify. Legacy adapters cannot run on a plugin
-    // environment, so Paperclip Runner is the only choice.
+  if (target.runnerTasks || target.managedCloudImage) {
     return runnerAdaptersAvailable(harness, target.driver)
-      ? { supportedRunners: ["paperclip"], defaultRunner: "paperclip" }
+      ? { supportedRunners: target.runnerTasks ? ["paperclip"] : ["paperclip", "legacy"], defaultRunner: "paperclip" }
       : { supportedRunners: ["legacy"], defaultRunner: "legacy" };
   }
   const supported = runnerAdaptersAvailable(harness, target.driver)
@@ -334,6 +333,15 @@ export async function resolveAgentRunnerTargetForCompany(db: Db, companyId: stri
     if (taskDriver) target = { driver, runnerTasks: true, ...(taskDriver.warmTaskVersion === 1 ? { warmTaskVersion: 1 as const } : {}) };
   }
   if (driver === "sandbox" && environment) {
+    let managedCloudImage = usesManagedCloudSandboxImage(environment, null);
+    if (managedCloudImage) {
+      await resolveEnvironmentDriverConfigForRuntime(db, companyId, environment, {
+        applyCustomImageTemplate: true,
+        readOnlyCustomImageTemplate: true,
+        onResolvedCustomImageTemplate: () => { managedCloudImage = false; },
+      });
+      if (managedCloudImage) return { driver, managedCloudImage: true };
+    }
     const { readSandboxPlatformQualification } = await import("./environment-probe.js");
     const qualified = await readSandboxPlatformQualification(db, environment, companyId);
     if (qualified) target = { driver, ...qualified };

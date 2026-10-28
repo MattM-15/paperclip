@@ -20,7 +20,7 @@ const target = { driver: "local", platform: "linux", architecture: "x64" };
 const qualifiedTargets = [target, { driver: "local", platform: "linux", architecture: "arm64" }, { driver: "local", platform: "darwin", architecture: "arm64" }, { driver: "local", platform: "darwin", architecture: "x64" }];
 const originalPlatform = Object.getOwnPropertyDescriptor(process, "platform")!;
 const originalArchitecture = Object.getOwnPropertyDescriptor(process, "arch")!;
-afterEach(() => { vi.restoreAllMocks(); Object.defineProperty(process, "platform", originalPlatform); Object.defineProperty(process, "arch", originalArchitecture); });
+afterEach(() => { vi.restoreAllMocks(); vi.unstubAllEnvs(); Object.defineProperty(process, "platform", originalPlatform); Object.defineProperty(process, "arch", originalArchitecture); });
 
 describe("server-owned Codex runner selection", () => {
   beforeEach(() => { state.disabled = []; state.overridden.clear(); state.settings = {}; state.getEnvironment.mockReset(); state.bindings.mockReset().mockResolvedValue([]); state.managedEnvironment.mockReset(); state.kubernetesEnvironment.mockReset().mockResolvedValue(null); state.ensureKubernetesEnvironment.mockReset(); state.ssh.mockReset().mockResolvedValue({ stdout: "Linux\nx86_64\n" }); state.sandboxQualification.mockReset().mockResolvedValue(null); state.resolveEnvironment.mockReset().mockResolvedValue({ driver: "ssh", config: {} }); });
@@ -465,6 +465,43 @@ describe("server-owned Codex runner selection", () => {
     expect(result.adapterType).toBe("codex_local"); expect(state.ssh).not.toHaveBeenCalled();
     expect(state.sandboxQualification).toHaveBeenCalledWith({}, expect.objectContaining({ id: "sandbox" }), "company");
     await expect(resolveNewAgentRunnerForCompany({} as never, "company", { adapterType: "codex_local", runner: "paperclip", defaultEnvironmentId: "sandbox" })).rejects.toMatchObject({ status: 422, details: { code: "agent_runner_unavailable" } });
+  });
+  it.each(["codex_local", "claude_local", "opencode_local"])("selects %s on a managed Cloud image without saved platform qualification", async adapterType => {
+    vi.stubEnv("PAPERCLIP_MANAGED_CONFIG", "{}");
+    state.getEnvironment.mockResolvedValue({ id: "sandbox", driver: "sandbox", status: "active",
+      config: { provider: "daytona", snapshot: "replacement-snapshot" }, metadata: { managedByPaperclip: true } });
+    state.resolveEnvironment.mockResolvedValue({ driver: "sandbox", config: { provider: "daytona", snapshot: "replacement-snapshot" } });
+    const selected = await resolveAgentRunnerTargetForCompany({} as never, "company", "sandbox");
+    expect(agentRunnerAvailability(adapterType, selected).defaultRunner).toBe("paperclip");
+    expect(await resolveNewAgentRunnerForCompany({} as never, "company", {
+      adapterType, defaultEnvironmentId: "sandbox", adapterConfig: { model: adapterType === "opencode_local" ? "provider/model" : undefined },
+    })).toMatchObject({ adapterType: "paperclip_runner" });
+    expect(state.sandboxQualification).not.toHaveBeenCalled();
+    state.disabled.push("paperclip_runner");
+    expect(agentRunnerAvailability(adapterType, selected).defaultRunner).toBe("legacy");
+  });
+  it.each(["self-hosted", "custom-environment", "captured-template"])("keeps qualification for a %s sandbox", async kind => {
+    vi.stubEnv("PAPERCLIP_MANAGED_CONFIG", kind === "self-hosted" ? undefined : "{}");
+    vi.stubEnv("PAPERCLIP_CLOUD_TENANT_SERVER_TOKEN", undefined);
+    state.getEnvironment.mockResolvedValue({ id: "sandbox", driver: "sandbox", status: "active",
+      config: { provider: "daytona", snapshot: "custom-snapshot" },
+      metadata: { managedByPaperclip: kind !== "custom-environment" } });
+    state.resolveEnvironment.mockImplementation(async (_db, _company, _environment, context) => {
+      context.onResolvedCustomImageTemplate({ id: "template", capturedAt: "2026-10-15T00:00:00Z", templateKind: "snapshot", bindingField: "snapshot" });
+      return { driver: "sandbox", config: { provider: "daytona", snapshot: "custom-snapshot" } };
+    });
+    const selected = await resolveAgentRunnerTargetForCompany({} as never, "company", "sandbox");
+    expect(agentRunnerAvailability("codex_local", selected).defaultRunner).toBe("legacy");
+    expect(state.sandboxQualification).toHaveBeenCalled();
+  });
+  it("checks company access before trusting a managed Cloud image", async () => {
+    vi.stubEnv("PAPERCLIP_MANAGED_CONFIG", "{}");
+    state.getEnvironment.mockResolvedValue({ id: "sandbox", driver: "sandbox", status: "active",
+      config: { provider: "daytona" }, metadata: { managedByPaperclip: true } });
+    state.bindings.mockResolvedValue(["another-company"]);
+    await expect(resolveAgentRunnerTargetForCompany({} as never, "company", "sandbox"))
+      .rejects.toMatchObject({ status: 403, details: { code: "environment_company_mismatch" } });
+    expect(state.resolveEnvironment).not.toHaveBeenCalled();
   });
 });
 

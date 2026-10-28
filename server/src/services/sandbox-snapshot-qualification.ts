@@ -1,7 +1,14 @@
 import type { Environment, SandboxEnvironmentConfig } from "@paperclipai/shared";
 import { fingerprintEnvironmentSandboxProviderConfig, SANDBOX_PLATFORM_PROBE_METADATA_KEY } from "./environment-custom-image-runtime.js";
+import { isCloudManagedInstance } from "./cloud-instance.js";
 
 export type SandboxTemplateIdentity = { id: string; capturedAt: string | null; templateKind: string; bindingField: string } | null;
+
+export function usesManagedCloudSandboxImage(environment: Environment, template: SandboxTemplateIdentity): boolean {
+  return isCloudManagedInstance() && environment.driver === "sandbox"
+    && environment.metadata?.managedByPaperclip === true && template === null;
+}
+
 export type SandboxSnapshotIdentity = {
   provider: "daytona";
   requestedRef: string;
