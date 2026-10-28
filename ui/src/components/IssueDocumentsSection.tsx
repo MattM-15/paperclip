@@ -19,6 +19,7 @@ import { describeError } from "../api/errors";
 import { loadStructuredDraft, saveStructuredDraft } from "../lib/composer-draft";
 import { copyTextToClipboard } from "../lib/clipboard";
 import { deriveDocumentRevisionState } from "../lib/document-revisions";
+import { parseDocumentAnnotationHash } from "../lib/document-annotation-hash";
 import type { CompanyUserProfile } from "../lib/company-members";
 import { queryKeys } from "../lib/queryKeys";
 import { useDraftOwner } from "../hooks/useDraftOwner";
@@ -354,6 +355,9 @@ function AccountIssueDocumentsSection({
   const [highlightDocumentKey, setHighlightDocumentKey] = useState<string | null>(null);
   const [revisionMenuOpenKey, setRevisionMenuOpenKey] = useState<string | null>(null);
   const [selectedRevisionIds, setSelectedRevisionIds] = useState<Record<string, string | null>>({});
+  const [handledRevisionHash, setHandledRevisionHash] = useState<string | null>(null);
+  const documentHashTarget = useMemo(() => parseDocumentAnnotationHash(location.hash), [location.hash]);
+  const revisionsQueryDocumentKey = revisionMenuOpenKey ?? (documentHashTarget?.revisionId ? documentHashTarget.documentKey : null);
   const [diffViewKey, setDiffViewKey] = useState<string | null>(null);
   const autosaveDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const copiedDocumentTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -375,15 +379,15 @@ function AccountIssueDocumentsSection({
     queryFn: documentSubject.listDocuments,
   });
 
-  const { data: activeDocumentRevisions, isFetching: isFetchingDocumentRevisions } = useQuery({
-    queryKey: revisionMenuOpenKey
-      ? documentSubject.documentRevisionsQueryKey(revisionMenuOpenKey)
+  const { data: activeDocumentRevisions, isFetching: isFetchingDocumentRevisions, isError: revisionsQueryFailed } = useQuery({
+    queryKey: revisionsQueryDocumentKey
+      ? documentSubject.documentRevisionsQueryKey(revisionsQueryDocumentKey)
       : documentSubject.idleDocumentRevisionsQueryKey,
     queryFn: async () => {
-      if (!revisionMenuOpenKey) return [];
-      return documentSubject.listDocumentRevisions(revisionMenuOpenKey);
+      if (!revisionsQueryDocumentKey) return [];
+      return documentSubject.listDocumentRevisions(revisionsQueryDocumentKey);
     },
-    enabled: Boolean(revisionMenuOpenKey),
+    enabled: Boolean(revisionsQueryDocumentKey),
   });
 
   const invalidateIssueDocuments = useCallback(() => {
@@ -777,9 +781,9 @@ function AccountIssueDocumentsSection({
   const getDocumentRevisions = useCallback((key: string) => {
     const cached = queryClient.getQueryData<DocumentRevision[]>(documentSubject.documentRevisionsQueryKey(key));
     if (cached) return cached;
-    if (revisionMenuOpenKey === key) return activeDocumentRevisions ?? [];
+    if (revisionsQueryDocumentKey === key) return activeDocumentRevisions ?? [];
     return [];
-  }, [activeDocumentRevisions, documentSubject, queryClient, revisionMenuOpenKey]);
+  }, [activeDocumentRevisions, documentSubject, queryClient, revisionsQueryDocumentKey]);
 
   const returnToLatestRevision = useCallback((key: string) => {
     setSelectedRevisionIds((current) => ({ ...current, [key]: null }));
@@ -789,14 +793,14 @@ function AccountIssueDocumentsSection({
   const previewRevision = useCallback((doc: IssueDocument, revisionId: string) => {
     const revisionState = deriveDocumentRevisionState(doc, getDocumentRevisions(doc.key));
     const selectedRevision = revisionState.revisions.find((revision) => revision.id === revisionId);
-    if (!selectedRevision) return;
+    if (!selectedRevision) return false;
     if (selectedRevision.id === revisionState.currentRevision.id) {
       returnToLatestRevision(doc.key);
-      return;
+      return true;
     }
     if (documentConflict?.key === doc.key || documentHasUnsavedChanges(doc, draft)) {
       setError("Save or cancel your local changes before viewing an older revision.");
-      return;
+      return false;
     }
     resetAutosaveState();
     setDraft((current) => current?.key === doc.key ? null : current);
@@ -804,6 +808,7 @@ function AccountIssueDocumentsSection({
     setFoldedDocumentKeys((current) => current.filter((entry) => entry !== doc.key));
     setSelectedRevisionIds((current) => ({ ...current, [doc.key]: selectedRevision.id }));
     setError(null);
+    return true;
   }, [documentConflict, draft, getDocumentRevisions, resetAutosaveState, returnToLatestRevision]);
 
   const toggleDocumentLock = useCallback((doc: IssueDocument, locked: boolean) => {
@@ -840,6 +845,8 @@ function AccountIssueDocumentsSection({
 
   useEffect(() => {
     setFoldedDocumentKeys(loadFoldedDocumentKeys(documentSubject.id));
+    setHandledRevisionHash(null);
+    setSelectedRevisionIds({});
   }, [documentSubject.id]);
 
   useEffect(() => {
@@ -873,9 +880,8 @@ function AccountIssueDocumentsSection({
   }, [documentConflict, sortedDocuments]);
 
   useEffect(() => {
-    const hash = location.hash;
-    if (!hash.startsWith("#document-")) return;
-    const documentKey = decodeURIComponent(hash.slice("#document-".length));
+    const documentKey = documentHashTarget?.documentKey;
+    if (!documentKey) return;
     const targetExists = sortedDocuments.some((doc) => doc.key === documentKey)
       || (documentKey === "plan" && Boolean(documentSubject.legacyPlanDocument));
     if (!targetExists || hasScrolledToHashRef.current) return;
@@ -887,7 +893,25 @@ function AccountIssueDocumentsSection({
     element.scrollIntoView({ behavior: "smooth", block: "center" });
     const timer = setTimeout(() => setHighlightDocumentKey((current) => current === documentKey ? null : current), 3000);
     return () => clearTimeout(timer);
-  }, [documentSubject.legacyPlanDocument, location.hash, sortedDocuments]);
+  }, [documentSubject.legacyPlanDocument, documentHashTarget, sortedDocuments]);
+
+  useEffect(() => {
+    if (!documentHashTarget?.revisionId || handledRevisionHash === location.hash) return;
+    const doc = sortedDocuments.find((entry) => entry.key === documentHashTarget.documentKey);
+    if (!doc) return;
+    if (revisionsQueryFailed) {
+      setError("Could not load the reviewed revision. Try opening the link again.");
+      return;
+    }
+    if (!getDocumentRevisions(doc.key).some((revision) => revision.id === documentHashTarget.revisionId)
+      && doc.latestRevisionId !== documentHashTarget.revisionId) {
+      if (!isFetchingDocumentRevisions && activeDocumentRevisions !== undefined) {
+        setError("The reviewed revision is unavailable.");
+      }
+      return;
+    }
+    if (previewRevision(doc, documentHashTarget.revisionId)) setHandledRevisionHash(location.hash);
+  }, [activeDocumentRevisions, documentHashTarget, getDocumentRevisions, handledRevisionHash, isFetchingDocumentRevisions, location.hash, previewRevision, revisionsQueryFailed, sortedDocuments]);
 
   useEffect(() => {
     return () => {
@@ -1111,7 +1135,11 @@ function AccountIssueDocumentsSection({
           const displayedTitle = selectedHistoricalRevision
             ? selectedHistoricalRevision.title ?? ""
             : activeDraft?.title ?? currentRevision.title ?? "";
-          const displayedBody = selectedHistoricalRevision?.body ?? activeDraft?.body ?? currentRevision.body;
+          const waitingForLinkedRevision = documentHashTarget?.documentKey === doc.key
+            && Boolean(documentHashTarget.revisionId) && handledRevisionHash !== location.hash;
+          const displayedBody = waitingForLinkedRevision
+            ? (error ?? "Loading reviewed revision…")
+            : selectedHistoricalRevision?.body ?? activeDraft?.body ?? currentRevision.body;
           const displayedRevisionNumber = selectedHistoricalRevision?.revisionNumber ?? currentRevision.revisionNumber;
           const displayedUpdatedAt = selectedHistoricalRevision?.createdAt ?? currentRevision.createdAt;
           const showTitle = !isPlanKey(doc.key) && !!displayedTitle.trim() && !titlesMatchKey(displayedTitle, doc.key);

@@ -60,9 +60,8 @@ vi.mock("../api/auth", () => ({
   },
 }));
 
-vi.mock("@/lib/router", () => ({
-  useLocation: () => ({ hash: "" }),
-}));
+const mockLocation = vi.hoisted(() => ({ hash: "" }));
+vi.mock("@/lib/router", () => ({ useLocation: () => mockLocation }));
 
 vi.mock("./MarkdownBody", () => ({
   MarkdownBody: ({
@@ -302,10 +301,55 @@ describe("IssueDocumentsSection", () => {
     markdownEditorMockState.emitMountEmptyChange = false;
     markdownEditorMockState.emitMountValue = null;
     mockSession.unreachable = false;
+    mockLocation.hash = "";
   });
 
   afterEach(() => {
     container.remove();
+  });
+
+  it("unfolds a Classic confirmation link and loads its bound revision rather than the latest text", async () => {
+    const root = createRoot(container);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    mockLocation.hash = "#document-plan&revision=revision-3&interaction=review-1";
+    localStorage.setItem("paperclip:issue-document-folds:issue-1", JSON.stringify(["plan"]));
+    mockIssuesApi.listDocuments.mockResolvedValue([createIssueDocument({ body: "Newer unreviewed text" })]);
+    let loadHistory!: (value: DocumentRevision[]) => void;
+    mockIssuesApi.listDocumentRevisions.mockReturnValue(new Promise<DocumentRevision[]>((resolve) => { loadHistory = resolve; }));
+    const scroll = vi.spyOn(Element.prototype, "scrollIntoView");
+    await act(async () => root.render(<QueryClientProvider client={queryClient}><IssueDocumentsSection issue={createIssue()} canDeleteDocuments={false} /></QueryClientProvider>));
+    await flush();
+    expect(mockIssuesApi.listDocumentRevisions).toHaveBeenCalledWith("issue-1", "plan");
+    expect(scroll).toHaveBeenCalled();
+    expect(container.textContent).toContain("Loading reviewed revision");
+    expect(container.textContent).not.toContain("Newer unreviewed text");
+    await act(async () => loadHistory([createRevision({ body: "Exact reviewed text" })]));
+    await flush();
+    expect(container.textContent).toContain("Viewing revision 3");
+    expect(container.textContent).toContain("Exact reviewed text");
+    expect(container.textContent).not.toContain("Newer unreviewed text");
+    const latest = Array.from(container.querySelectorAll("button")).find((button) => button.textContent?.includes("Return to latest"));
+    expect(latest).toBeTruthy();
+    await act(async () => latest!.click());
+    expect(container.textContent).toContain("Newer unreviewed text");
+    await act(async () => root.unmount());
+    scroll.mockRestore();
+    queryClient.clear();
+  });
+
+  it("does not substitute newer content when a Classic review revision is missing", async () => {
+    const root = createRoot(container);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    mockLocation.hash = "#document-plan&revision=missing&interaction=review-1";
+    mockIssuesApi.listDocuments.mockResolvedValue([createIssueDocument({ body: "Newer unreviewed text" })]);
+    mockIssuesApi.listDocumentRevisions.mockResolvedValue([]);
+    await act(async () => root.render(<QueryClientProvider client={queryClient}><IssueDocumentsSection issue={createIssue()} canDeleteDocuments={false} /></QueryClientProvider>));
+    await flush();
+    await flush();
+    expect(container.textContent).toContain("The reviewed revision is unavailable");
+    expect(container.textContent).not.toContain("Newer unreviewed text");
+    await act(async () => root.unmount());
+    queryClient.clear();
   });
 
   it("keeps system handoff documents out of the normal document surface", async () => {

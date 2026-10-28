@@ -6139,8 +6139,27 @@ export function issueRoutes(
       interaction,
       selectedClientKeys,
     });
-    for (const task of selectedTasks) {
-      const assignment = resolveChatTaskAssignment(task, issue.conversationAgentId);
+    const taskByClientKey = new Map(selectedTasks.map((task) => [task.clientKey, task]));
+    type ProposedScope = {
+      parent: Awaited<ReturnType<typeof svc.getById>> | typeof issue;
+      projectId: string | null;
+    };
+    const scopes = new Map<string, ProposedScope>();
+    const resolveScope = async (task: (typeof selectedTasks)[number]): Promise<ProposedScope> => {
+      const cached = scopes.get(task.clientKey);
+      if (cached) return cached;
+      if (task.parentClientKey) {
+        const parentTask = taskByClientKey.get(task.parentClientKey)!;
+        const parentScope = await resolveScope(parentTask);
+        // createChild inherits the proposed parent's project after the explicit
+        // task and source projects. Check the same project before creating it.
+        const scope = {
+          parent: parentScope.parent,
+          projectId: task.projectId ?? issue.projectId ?? parentScope.projectId,
+        };
+        scopes.set(task.clientKey, scope);
+        return scope;
+      }
       const proposedParentIssueId =
         task.parentId ?? interaction.payload.defaultParentId ?? (issue.conversationAgentId ? null : issue.id);
       const explicitParentIssueId = issue.conversationAgentId && proposedParentIssueId === issue.id
@@ -6149,7 +6168,17 @@ export function issueRoutes(
         explicitParentIssueId === null ? null : explicitParentIssueId === issue.id
           ? issue
           : await svc.getById(explicitParentIssueId);
-      if (explicitParentIssueId && (!parent || parent.companyId !== issue.companyId)) {
+      if (explicitParentIssueId && !parent) {
+        throw forbidden("Suggested-task parent is outside the resolver's authorized issue scope");
+      }
+      const scope = { parent, projectId: task.projectId ?? issue.projectId ?? parent?.projectId ?? null };
+      scopes.set(task.clientKey, scope);
+      return scope;
+    };
+    for (const task of selectedTasks) {
+      const assignment = resolveChatTaskAssignment(task, issue.conversationAgentId);
+      const { parent, projectId } = await resolveScope(task);
+      if (parent && parent.companyId !== issue.companyId) {
         return denyIssueThreadInteractionResolution(res, {
           status: 403,
           code: "interaction_governed_action_denied",
@@ -6158,7 +6187,6 @@ export function issueRoutes(
         });
       }
       if (parent && !(await assertIssueReadAllowed(req, res, parent))) return false;
-      const projectId = task.projectId ?? issue.projectId ?? parent?.projectId ?? null;
       if (projectId) {
         const project = await projectsSvc.getById(projectId);
         if (!project || project.companyId !== issue.companyId) {

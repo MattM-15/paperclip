@@ -3407,6 +3407,39 @@ describe("issue thread interaction routes", () => {
       }));
     });
 
+    it.each([false, true])("authorizes inherited proposal projects independently of array order (child first: %s)", async (childFirst) => {
+      const projectId = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+      const tasks = [
+        { clientKey: "root", title: "Launch", projectId },
+        { clientKey: "child", parentClientKey: "root", title: "Write copy" },
+        { clientKey: "grandchild", parentClientKey: "child", title: "Review copy" },
+      ];
+      suggest({}, { tasks: childFirst ? tasks.toReversed() : tasks });
+      mockAccessDecide.mockImplementation(async (input: { action?: string; resource?: { projectId?: string } }) => ({
+        allowed: input.action !== "tasks:assign" || input.resource?.projectId === projectId,
+        action: input.action, reason: "project_scoped_grant", explanation: "Only project A assignments are permitted",
+      }));
+      expect((await request(await createApp(owner)).post(path).send({})).status).toBe(200);
+      const assignments = mockAccessDecide.mock.calls.filter(([input]) => input.action === "tasks:assign");
+      expect(assignments).toHaveLength(3);
+      expect(assignments.every(([input]) => input.resource.projectId === projectId)).toBe(true);
+      expect(mockInteractionService.acceptInteraction).toHaveBeenCalledOnce();
+    });
+
+    it("rejects a nested proposal's explicit project outside the assignment grant", async () => {
+      const allowedProject = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+      suggest({}, { tasks: [
+        { clientKey: "root", title: "Launch", projectId: allowedProject },
+        { clientKey: "child", parentClientKey: "root", title: "Write copy", projectId: OTHER_ISSUE_ID },
+      ] });
+      mockAccessDecide.mockImplementation(async (input: { action?: string; resource?: { projectId?: string } }) => ({
+        allowed: input.action !== "tasks:assign" || input.resource?.projectId === allowedProject,
+        action: input.action, reason: "project_scoped_grant", explanation: "Only project A assignments are permitted",
+      }));
+      expect((await request(await createApp(owner)).post(path).send({})).status).toBe(403);
+      expectNoEffects();
+    });
+
     it("checks the selected subset without authorizing an unselected assignment", async () => {
       suggest({}, { tasks: [
         { clientKey: "task-1", title: "Unassigned draft" },
