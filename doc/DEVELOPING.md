@@ -1051,6 +1051,8 @@ custom images keep their existing qualification and snapshot binding.
 The active Cloud configuration must still provision the sandbox provider; a
 leftover managed marker alone does not enable this policy. Discovery reads
 custom-image metadata without resolving provider credentials.
+Outdated captures that no longer match the base configuration do not change
+the managed runner default, consistent with execution's template selection.
 
 ### Local Linux runner qualification
 

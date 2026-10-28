@@ -8,10 +8,11 @@ import { getDisabledAdapterTypes } from "./adapter-plugin-store.js";
 import { claudeRunnerUnsupportedSettings, PaperclipRunnerProviderProfileError, resolvePaperclipRunnerNativeProviderInput } from "./native-runtime/provider-profile.js";
 import { forbidden, unprocessable } from "../errors.js";
 import { runSshCommand } from "@paperclipai/adapter-utils/ssh";
-import { parseEnvironmentDriverConfig, resolveEnvironmentDriverConfigForRuntime } from "./environment-config.js";
+import { parseEnvironmentDriverConfig, resolveEnvironmentDriverConfigForRuntime, resolveSandboxProviderSecretRefPaths } from "./environment-config.js";
 import { localAgentRunnerTarget } from "../lib/agent-runner-platform.js";
 import { normalizeClaudeRunnerOptions, type AgentConfigurationWarning } from "@paperclipai/shared";
 import { usesManagedCloudSandboxImage } from "./sandbox-snapshot-qualification.js";
+import { environmentCustomImageTemplateMatchesBaseConfig } from "./environment-custom-image-runtime.js";
 
 export type RunnerTarget = {
   driver: string; platform?: string; architecture?: string; libc?: "glibc" | "musl" | "unknown"; glibcVersion?: string;
@@ -340,6 +341,16 @@ export async function resolveAgentRunnerTargetForCompany(db: Db, companyId: stri
         provider: typeof environment.config.provider === "string" ? environment.config.provider : null,
       });
       if (!template?.templateRef) return { driver, managedCloudImage: true };
+      try {
+        const parsed = parseEnvironmentDriverConfig(environment);
+        if (parsed.driver === "sandbox" && !environmentCustomImageTemplateMatchesBaseConfig({
+          template,
+          baseConfig: parsed.config,
+          secretRefExcludePaths: await resolveSandboxProviderSecretRefPaths(db, template.provider),
+        })) return { driver, managedCloudImage: true };
+      } catch {
+        return { driver };
+      }
     }
     const { readSandboxPlatformQualification } = await import("./environment-probe.js");
     const qualified = await readSandboxPlatformQualification(db, environment, companyId);

@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { agentHarnessType, agentRunner, paperclipRunnerProfileForHarness, paperclipRunnerSupportsPlatform, PAPERCLIP_RUNNER_MINIMUM_GLIBC_VERSION, createAgentSchema, updateAgentSchema, testAdapterEnvironmentSchema } from "@paperclipai/shared";
-const state = vi.hoisted(() => ({ disabled: [] as string[], overridden: new Set<string>(), settings: {} as Record<string, unknown>, getEnvironment: vi.fn(), bindings: vi.fn(), activeTemplate: vi.fn().mockResolvedValue(null), managedEnvironment: vi.fn(), kubernetesEnvironment: vi.fn(), ensureKubernetesEnvironment: vi.fn(), ssh: vi.fn(), resolveEnvironment: vi.fn(), sandboxQualification: vi.fn(), pluginByKey: vi.fn() }));
+const state = vi.hoisted(() => ({ disabled: [] as string[], overridden: new Set<string>(), settings: {} as Record<string, unknown>, getEnvironment: vi.fn(), bindings: vi.fn(), activeTemplate: vi.fn().mockResolvedValue(null), secretPaths: vi.fn().mockResolvedValue(new Set(["apiKey"])), managedEnvironment: vi.fn(), kubernetesEnvironment: vi.fn(), ensureKubernetesEnvironment: vi.fn(), ssh: vi.fn(), resolveEnvironment: vi.fn(), sandboxQualification: vi.fn(), pluginByKey: vi.fn() }));
 vi.mock("../adapters/registry.js", () => ({ findActiveServerAdapter: (type: string) => ({ type }), hasActiveAdapterOverride: (type: string) => state.overridden.has(type), waitForExternalAdapters: async () => {} }));
 vi.mock("./adapter-plugin-store.js", () => ({ getDisabledAdapterTypes: () => state.disabled }));
 vi.mock("./instance-settings.js", () => ({ instanceSettingsService: () => ({ get: async () => state.settings }) }));
@@ -10,6 +10,7 @@ vi.mock("./environment-probe.js", () => ({ readSandboxPlatformQualification: sta
 vi.mock("./environment-config.js", async () => ({
   parseEnvironmentDriverConfig: (await vi.importActual<typeof import("./environment-config.js")>("./environment-config.js")).parseEnvironmentDriverConfig,
   resolveEnvironmentDriverConfigForRuntime: state.resolveEnvironment,
+  resolveSandboxProviderSecretRefPaths: state.secretPaths,
 }));
 vi.mock("./plugin-registry.js", () => ({ pluginRegistryService: () => ({ getByKey: state.pluginByKey }) }));
 vi.mock("@paperclipai/adapter-utils/ssh", () => ({ runSshCommand: state.ssh }));
@@ -17,6 +18,7 @@ import { AGENT_RUNNER_SSH_PLATFORM_COMMAND, agentRunnerAvailability, resolveAgen
 import { buildCodexAcpConfig, resolveCodexExecutionEngine } from "@paperclipai/adapter-codex-local/server";
 import { secretService } from "./secrets.js";
 import * as localPlatform from "../lib/agent-runner-platform.js";
+import { fingerprintEnvironmentSandboxProviderConfig as fingerprint } from "./environment-custom-image-runtime.js";
 const target = { driver: "local", platform: "linux", architecture: "x64" };
 const qualifiedTargets = [target, { driver: "local", platform: "linux", architecture: "arm64" }, { driver: "local", platform: "darwin", architecture: "arm64" }, { driver: "local", platform: "darwin", architecture: "x64" }];
 const originalPlatform = Object.getOwnPropertyDescriptor(process, "platform")!;
@@ -491,10 +493,32 @@ describe("server-owned Codex runner selection", () => {
     state.getEnvironment.mockResolvedValue({ id: "sandbox", driver: "sandbox", status: "active",
       config: { provider: "daytona", snapshot: "custom-snapshot" },
       metadata: { managedByPaperclip: kind !== "custom-environment" } });
-    state.activeTemplate.mockResolvedValue(kind === "captured-template" ? { id: "template", templateRef: "custom-snapshot" } : null);
+    state.activeTemplate.mockResolvedValue(kind === "captured-template" ? { id: "template", provider: "daytona", templateRef: "custom-snapshot" } : null);
     const selected = await resolveAgentRunnerTargetForCompany({} as never, "company", "sandbox");
     expect(agentRunnerAvailability("codex_local", selected).defaultRunner).toBe("legacy");
     expect(state.sandboxQualification).toHaveBeenCalled();
+  });
+  it("ignores a stale captured image and preserves a matching custom image without resolving credentials", async () => {
+    vi.stubEnv("PAPERCLIP_MANAGED_CONFIG", JSON.stringify({ ...managedCloudConfig, environments: [{ name: "Paperclip Computer", provider: "daytona", config: {} }] }));
+    const config = { provider: "daytona", snapshot: "replacement-snapshot", reuseLease: false, apiKey: "a6b9e7d0-f886-471a-b461-640dd03e8d0f" };
+    state.getEnvironment.mockResolvedValue({ id: "sandbox", driver: "sandbox", status: "active", config, metadata: { managedByPaperclip: true } });
+    state.resolveEnvironment.mockRejectedValue(new Error("Saved provider secret is unavailable."));
+    const template = { id: "template", provider: "daytona", templateRef: "custom-snapshot",
+      sourceEnvironmentConfigFingerprint: fingerprint({ ...config, snapshot: "previous-snapshot" }, { excludePaths: ["apiKey"] }) };
+    state.activeTemplate.mockResolvedValue(template);
+    const current = await resolveAgentRunnerTargetForCompany({} as never, "company", "sandbox");
+    expect(agentRunnerAvailability("codex_local", current).defaultRunner).toBe("paperclip");
+    expect(await resolveNewAgentRunnerForCompany({} as never, "company", { adapterType: "codex_local", runner: "paperclip", defaultEnvironmentId: "sandbox" }))
+      .toMatchObject({ adapterType: "paperclip_runner" });
+    expect(state.sandboxQualification).not.toHaveBeenCalled();
+    state.activeTemplate.mockResolvedValue({ ...template, sourceEnvironmentConfigFingerprint: fingerprint(config, { excludePaths: ["apiKey"] }) });
+    const custom = await resolveAgentRunnerTargetForCompany({} as never, "company", "sandbox");
+    expect(agentRunnerAvailability("codex_local", custom).defaultRunner).toBe("legacy");
+    expect(state.sandboxQualification).toHaveBeenCalled();
+    state.getEnvironment.mockResolvedValue({ id: "sandbox", driver: "sandbox", status: "active", config: { ...config, timeoutMs: "invalid" }, metadata: { managedByPaperclip: true } });
+    const invalid = await resolveAgentRunnerTargetForCompany({} as never, "company", "sandbox");
+    expect(agentRunnerAvailability("codex_local", invalid).defaultRunner).toBe("legacy");
+    expect(state.resolveEnvironment).not.toHaveBeenCalled();
   });
   it("checks company access before trusting a managed Cloud image", async () => {
     vi.stubEnv("PAPERCLIP_MANAGED_CONFIG", "{}");

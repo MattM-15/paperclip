@@ -59,6 +59,8 @@ handshake detect real incompatibility. This exception excludes custom
 environments and active captured custom images.
 The active Cloud configuration must provision the sandbox provider. A stale
 managed marker alone keeps the normal qualification rules.
+An outdated captured image that execution ignores must not block discovery of
+the current managed image. A matching custom capture keeps qualification.
 
 For other images, the measured record is server-owned, company-bound and tied to the effective
 configuration and active custom-image identity. Mutable tags, provider defaults
