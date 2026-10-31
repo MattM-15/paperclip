@@ -1,3 +1,9 @@
+import { nativeEnvironmentSettlementDisposition, nativeEnvironmentSettlementWork } from "../native-runtime/native-environment-settlement-work.js";
+import { nativeWorkspaceFinalizationWork } from "../native-runtime/native-workspace-finalization-work.js";
+import { attemptNativeWorkspaceFinalization } from "../native-runtime/native-workspace-finalizer.js";
+import { retainedNativeSessionCleanupWork } from "../native-runtime/retained-native-session-cleanup-work.js";
+import { reconcileRetainedNativeSessionCleanups } from "../native-runtime/retained-native-session-cleanup.js";
+import { createScheduledRetryCancellationRecovery } from "./scheduled-retry-cancellation.js";
 import { pendingCleanupDeadlineSql } from "../environment-cleanup-state.js";
 import { writeEnvironmentCleanup } from "../environment-cleanup-notifications.js";
 import { startNativeSessionExecutionLeaseRenewal, type NativeExecutionLeaseRenewal } from "../native-runtime/native-execution-lease.js";
@@ -12,7 +18,7 @@ import {
   hasStopOnlyCleanup,
   settleStopOnlyCleanup,
 } from "../sandbox-stop-and-retain.js";
-import { discoverSettledNativeRunProcesses, recordNativeLocalProcessStop, retryPendingSettledNativeRunProcesses } from "../native-local-process-stop.js";
+import { discoverSettledNativeRunProcesses, PROCESS_IDENTITY_RECORDED, PROCESS_START_REQUESTED, recordNativeLocalProcessStop, retryPendingSettledNativeRunProcesses } from "../native-local-process-stop.js";
 import { pendingCaseHandoffForRun } from "./case-handoff-lifecycle.js";
 import {
   legacyControllerBootId,
@@ -24,9 +30,11 @@ import { runUsedConversationAdapter } from "../conversation-continuation.js";
 import { legacyExecutionNeedsReconciliationWithEvidence, terminalizeLegacyExecution } from "../legacy-execution-recovery.js";
 import { reconcileRetainedWorkspaces } from "../workspace-recovery.js";
 import { randomUUID } from "node:crypto";
+import os from "node:os";
 import {
   and,
   asc,
+  desc,
   eq,
   gt,
   inArray,
@@ -40,6 +48,7 @@ import type { Db } from "@paperclipai/db";
 import {
   agents,
   environmentLeases,
+  heartbeatRunEvents,
   heartbeatRuns,
   issues,
   nativeRunFinalizations,
@@ -56,9 +65,7 @@ import {
   type NativeRestartRecoveryClaim,
   reconcileNativeFinalizations,
   reconcileRetainedNativeSessionCleanup,
-  reconcileRetainedNativeSessionCleanups,
 } from "../native-runtime/index.js";
-import { drainRetainedRunnerdMaintenanceOperations } from "../../vendor/paperclip-runner/index.js";
 import { runningProcesses } from "../../adapters/index.js";
 import { parseObject } from "../../adapters/utils.js";
 import {
@@ -82,7 +89,6 @@ import {
 } from "../hot-restart.js";
 import { serverVersion } from "../../version.js";
 import { adapterExecutionControls, waitForAdapterStop } from "../adapter-execution-control.js";
-import { readRunCancellation } from "../run-cancellation.js";
 import { allowLegacyShutdownWorkspaceCleanup, beginLegacyShutdownWorkspaceSettlement, finishLegacyShutdownWorkspaceSettlement, maintainLegacyShutdownWorkspaceSettlement, sweepLegacyShutdownWorkspaceSettlements } from "../legacy-shutdown-workspace-settlement.js";
 
 import type { environmentService } from "../environments.js";
@@ -118,6 +124,7 @@ export interface HeartbeatRecoveryDependencies extends Pick<HeartbeatRetryDepend
   executeRun: (runId: string, options?: {
     nativeLeaseOwner?: string;
     nativeRestartRecovery?: NativeRestartRecoveryClaim;
+    onNativeExecutionLeaseAcquired?: () => Promise<void>;
   }) => Promise<void>;
   scheduleNativeSessionResumeDispatch: (runId: string, nextAttemptAt: Date) => void;
   cancelHeartbeatNativeRun: (input: {
@@ -151,6 +158,7 @@ export interface HeartbeatRecoveryDependencies extends Pick<HeartbeatRetryDepend
     status: string | null | undefined;
     failureReason?: string | null;
     providerResourceDisposition?: ProviderResourceDisposition;
+    respectCleanupDeadlines?: boolean;
   }) => Promise<void>;
   acknowledgeRemoteStop: (runId: string, companyId: string) => Promise<void>;
   resumeRemoteStopComments: (run: HeartbeatRun) => Promise<void>;
@@ -390,6 +398,7 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
     scheduleInteractionContinuationInfrastructureRetryIfEligible,
     startNextQueuedRunForAgent,
   } = dependencies;
+  const scheduledRetryCancellation = createScheduledRetryCancellationRecovery(db, cancelRunInternal);
 
   async function enqueueProcessLossRetry(
     run: typeof heartbeatRuns.$inferSelect,
@@ -1047,13 +1056,16 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
         const execution = executeRun(claim.runId, {
           nativeLeaseOwner: claim.leaseOwner,
           nativeRestartRecovery: claim,
+          ...(preparationRenewal ? { onNativeExecutionLeaseAcquired: () => preparationRenewal.stop() } : {}),
         }).catch((error) => {
           logger.error(
             { err: error, runId: claim.runId, disposition: claim.kind },
             "native restart recovery execution failed",
           );
         }).finally(() => preparationRenewal?.stop().catch(() => undefined));
-        preparationRenewals.delete(claim.runId); // Execution now owns this reference.
+        // The executor releases preparation only after acquiring its own renewal.
+        // The finalizer above also covers exits before execution can acquire it.
+        preparationRenewals.delete(claim.runId);
         activeRunExecutionPromises.add(execution);
         void execution.finally(() =>
           activeRunExecutionPromises.delete(execution),
@@ -1568,7 +1580,7 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
             eq(environmentLeases.status, "active"),
           ),
         )
-        .returning({ id: environmentLeases.id }));
+        .returning({ id: environmentLeases.id }), { companyId: lease.companyId, runId: lease.heartbeatRunId ?? undefined });
       if (flipped.length > 0) recovered += 1;
     }
 
@@ -1811,7 +1823,7 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
             ? 30 * 60_000 : Math.min(30 * 60_000, Math.max(30_000, backoffMs))),
         })}::jsonb`,
       }).where(and(eq(environmentLeases.id, lease.id),
-        sql`${environmentLeases.metadata}->>'pendingCleanupAttemptId' = ${claimed}`)));
+        sql`${environmentLeases.metadata}->>'pendingCleanupAttemptId' = ${claimed}`)), { companyId: lease.companyId, runId: lease.heartbeatRunId ?? undefined });
       if (lease.heartbeatRunId) {
         // Delivery failure must not revert successful provider cleanup. A new
         // message can still use the persisted receipt on its next admission.
@@ -1825,6 +1837,29 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
 
     if (deferredFlushFailed) throw new Error("Deferred orphan cleanup flush failed");
     return { swept: rows.length, destroyed, capped };
+  }
+
+  async function nativeProcessIsLocal(run: HeartbeatRun) {
+    if (parseObject(run.runnerProfileJson).nativeWorkspaceSync != null) return false;
+    const [identity] = await db.select({
+      eventType: heartbeatRunEvents.eventType,
+      agentId: heartbeatRunEvents.agentId,
+      payload: heartbeatRunEvents.payload,
+    }).from(heartbeatRunEvents).where(and(
+      eq(heartbeatRunEvents.companyId, run.companyId),
+      eq(heartbeatRunEvents.runId, run.id),
+      isNull(heartbeatRunEvents.sourceEventId),
+      inArray(heartbeatRunEvents.eventType, [PROCESS_START_REQUESTED, PROCESS_IDENTITY_RECORDED]),
+    )).orderBy(desc(heartbeatRunEvents.seq)).limit(1);
+    const recorded = identity?.payload;
+    if (identity?.eventType !== PROCESS_IDENTITY_RECORDED || identity.agentId !== run.agentId ||
+        recorded?.targetKind !== "local" || recorded.hostname !== os.hostname() ||
+        recorded.processPid !== run.processPid || recorded.processGroupId !== run.processGroupId ||
+        !run.processStartedAt || recorded.processStartedAt !== run.processStartedAt.toISOString()) return false;
+    const leases = await db.select({ provider: environmentLeases.provider }).from(environmentLeases).where(and(
+      eq(environmentLeases.companyId, run.companyId), eq(environmentLeases.heartbeatRunId, run.id),
+    ));
+    return leases.every(lease => lease.provider === "local");
   }
 
   async function markNativeOwnershipUnverified(
@@ -1884,26 +1919,32 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
     return blocked;
   }
 
-  async function settleRecoveredNativeWorkspace(input: {
+  async function settleRecoveredNativeEnvironment(input: {
     runId: string;
     companyId: string;
     agentId: string;
     succeeded: boolean;
-  }) {
+  }, onlyTerminal = false) {
     const settledRun = await getRunWorkspaceSettlement(input.runId);
-    const workspaceSyncReference = readNativeWorkspaceSyncReference(
-      parseObject(settledRun?.runnerProfileJson).nativeWorkspaceSync,
-    );
+    if (!settledRun || onlyTerminal && !["succeeded", "failed", "cancelled", "timed_out", "interrupted"].includes(settledRun.status)) return;
     await releaseEnvironmentLeasesForRun({
       runId: input.runId,
       companyId: input.companyId,
       agentId: input.agentId,
       status: settledRun?.status,
       failureReason: settledRun?.error ?? undefined,
-      providerResourceDisposition: input.succeeded && (!parseObject(settledRun?.resultJson).workspaceExportRetry || workspaceSyncReference?.resourceDisposition === "destroy")
-        ? (workspaceSyncReference?.resourceDisposition ?? "stop_and_retain")
-        : "stop_and_retain",
+      providerResourceDisposition: nativeEnvironmentSettlementDisposition(settledRun, input.succeeded),
+      ...(onlyTerminal ? { respectCleanupDeadlines: true } : {}),
     });
+  }
+
+  const nativeEnvironmentSettlement = nativeEnvironmentSettlementWork(db, input => settleRecoveredNativeEnvironment(input, true));
+
+  async function settleRecoveredNativeWorkspace(input: {
+    runId: string; companyId: string; agentId: string; succeeded: boolean;
+  }, options?: { skipEnvironmentSettlement?: boolean }) {
+    if (!options?.skipEnvironmentSettlement) await settleRecoveredNativeEnvironment(input);
+    const settledRun = await getRun(input.runId);
     await releaseRuntimeServicesForRun(input.runId).catch(() => undefined);
     await finalizeAgentStatus(
       input.agentId,
@@ -1919,12 +1960,34 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
     ).catch(() => undefined);
   }
 
+  function cleanupRetainedNativeSession(input: { companyId: string; runId: string }) {
+    const operation = reconcileRetainedNativeSessionCleanup(db, input);
+
+
+    const tracked = operation.then(() => undefined, () => undefined);
+    activeRunExecutionPromises.add(tracked);
+    void tracked.then(() => activeRunExecutionPromises.delete(tracked));
+    return operation;
+  }
+  const retainedNativeCleanup = retainedNativeSessionCleanupWork(db, cleanupRetainedNativeSession);
+  const nativeWorkspaceFinalization = nativeWorkspaceFinalizationWork(db, {
+    environmentRuntime, pluginWorkerManager: dependencies.pluginWorkerManager,
+    onWorkspaceSettled: settleRecoveredNativeWorkspace,
+    attempt: input => {
+      const operation = attemptNativeWorkspaceFinalization(input);
+      const tracked = operation.then(() => undefined, () => undefined);
+      activeRunExecutionPromises.add(tracked);
+      void tracked.then(() => activeRunExecutionPromises.delete(tracked));
+      return operation;
+    },
+  });
+
   function scheduleRetainedNativeSessionCleanup() {
     // The per-database sweep joins startup and periodic callers. One bounded
     // control-only repair must not hold up unrelated provider ingress or the
     // entire orphan reaper, but shutdown must still await its physical owner.
     const cleanup = reconcileRetainedNativeSessionCleanups(db, {
-      cleanup: (input) => reconcileRetainedNativeSessionCleanup(db, input),
+      cleanup: cleanupRetainedNativeSession,
       onError: (error, runId) => {
         logger.warn(
           { err: error, runId },
@@ -1935,52 +1998,24 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
       .then(() => undefined)
       .catch((error) => {
         logger.warn({ err: error }, "retained native cleanup discovery failed");
-      })
-      // The bounded maintenance attempt may fail before an already-started
-      // database callback settles. Keep shutdown ownership until the original
-      // operations finish; their timeout cannot authorize closing the database.
-      .finally(() => drainRetainedRunnerdMaintenanceOperations());
+      });
     activeRunExecutionPromises.add(cleanup);
     void cleanup.finally(() => activeRunExecutionPromises.delete(cleanup));
   }
 
   let settledProcessesDiscovered = false;
 
-  async function reapOrphanedRuns(opts?: { staleThresholdMs?: number }) {
-    await preserveCancelledNativeWorkspaces(db);
+  async function reapOrphanedRuns(opts?: { staleThresholdMs?: number; skipScheduledRetryCancellation?: boolean; skipCapturedInstructionCommit?: boolean; skipInstructionDirectoryCleanup?: boolean; skipStoppedInstructionCollection?: boolean; skipCancelledWorkspacePreservation?: boolean; skipObsoletePolicyReviews?: boolean; skipAutomaticCompletionReviews?: boolean; skipUnsafeWorkspaceExports?: boolean; skipNativePendingEffects?: boolean; skipNativeResponsePresentation?: boolean; skipNativeReviewResponse?: boolean; skipNativeStatusReassessment?: boolean; skipRetainedNativeSessionCleanup?: boolean; skipNativeWorkspaceFinalization?: boolean; skipNativeResultCommit?: boolean; skipNativeRunProjection?: boolean; skipNativeRecoveryNotices?: boolean; skipExternalConversationSettlement?: boolean; skipExternalAgentSettlement?: boolean; skipNativeEnvironmentSettlement?: boolean }) {
+    if (!opts?.skipCancelledWorkspacePreservation) await preserveCancelledNativeWorkspaces(db);
     const staleThresholdMs = opts?.staleThresholdMs ?? 0;
     const now = new Date();
-    // A parked retry has no executor to finish a cancellation after a restart
-    // or a failed status write. Consume its durable intent through normal run
-    // control; the guarded CAS and terminal settlement make competing sweeps
-    // safe, and dispatch cannot promote a fenced retry in the meantime.
-    const interruptedRetryCancellations = await db.select().from(heartbeatRuns)
-      .where(and(
-        eq(heartbeatRuns.status, "scheduled_retry"),
-        sql`jsonb_typeof(${heartbeatRuns.resultJson}->'startupCancellation') = 'object'`,
-      ))
-      .orderBy(asc(heartbeatRuns.updatedAt), asc(heartbeatRuns.id))
-      .limit(20);
-    for (const run of interruptedRetryCancellations) {
-      const cancellation = readRunCancellation(run.resultJson);
-      if (!cancellation?.expected) continue;
-      try {
-        await cancelRunInternal(run.id, cancellation.reason, {
-          expectedStatus: "scheduled_retry",
-          errorCode: readNonEmptyString(parseObject(run.resultJson?.startupCancellation).errorCode) ?? "cancelled",
-          resultJson: parseObject(run.resultJson),
-        });
-      } catch (error) {
-        // Leave the durable intent for the next bounded periodic sweep.
-        logger.warn({ err: error, runId: run.id }, "failed to finish interrupted retry cancellation");
-      }
-    }
+    if (!opts?.skipScheduledRetryCancellation) await scheduledRetryCancellation.sweep();
     // Recovery never launches a provider or infers stopped ownership from
     // terminal status. Uncaptured local copies require durable stop evidence.
-    await instructionCopies.recoverStopped().catch(error => {
+    if (!opts?.skipStoppedInstructionCollection) await instructionCopies.recoverStopped().catch(error => {
       logger.warn({ err: error }, "failed to recover stopped instruction copies");
     });
-    await instructionCopies.recoverCaptured().catch(error => {
+    await instructionCopies.recoverCaptured({ skipCommit: opts?.skipCapturedInstructionCommit, skipDirectoryCleanup: opts?.skipInstructionDirectoryCleanup }).catch(error => {
       logger.warn({ err: error }, "failed to retry captured instruction revisions");
     });
 
@@ -1988,16 +2023,31 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
     // reconciler reads the durable workspace barrier and persisted runtime
     // mode, never the current feature flag.
     await reconcileNativeFinalizations(db, undefined, {
+      skipObsoletePolicyReviews: opts?.skipObsoletePolicyReviews,
+      skipAutomaticCompletionReviews: opts?.skipAutomaticCompletionReviews,
+      skipUnsafeWorkspaceExports: opts?.skipUnsafeWorkspaceExports,
+      skipNativePendingEffects: opts?.skipNativePendingEffects,
+      skipNativeResponsePresentation: opts?.skipNativeResponsePresentation,
+      skipNativeReviewResponse: opts?.skipNativeReviewResponse,
+      skipNativeStatusReassessment: opts?.skipNativeStatusReassessment,
+      skipNativeWorkspaceFinalization: opts?.skipNativeWorkspaceFinalization,
+      skipNativeResultCommit: opts?.skipNativeResultCommit,
+      skipNativeRunProjection: opts?.skipNativeRunProjection,
+      skipExternalConversationSettlement: opts?.skipExternalConversationSettlement,
+      skipExternalAgentSettlement: opts?.skipExternalAgentSettlement,
+      skipNativeRecoveryNotices: opts?.skipNativeRecoveryNotices,
       environmentRuntime,
       pluginWorkerManager: dependencies.pluginWorkerManager,
-      onWorkspaceSettled: settleRecoveredNativeWorkspace,
+      onWorkspaceSettled: input => settleRecoveredNativeWorkspace(input, {
+        skipEnvironmentSettlement: opts?.skipNativeEnvironmentSettlement,
+      }),
     }).catch((error) => {
       logger.warn(
         { err: error },
         "failed to reconcile persisted native finalizations before orphan reaping",
       );
     });
-    scheduleRetainedNativeSessionCleanup();
+    if (!opts?.skipRetainedNativeSessionCleanup) scheduleRetainedNativeSessionCleanup();
     await reconcileRetainedWorkspaces(db, environmentRuntime, resumeRemoteStopComments);
     await dispatchPendingNativeStatusWakeups().catch((error) => {
       logger.warn(
@@ -2006,13 +2056,12 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
       );
     });
 
-    // A retryable native run can retain process identifiers from the failed
-    // attempt. Inspect them before the recovery claim: a live identifier is
-    // unowned and blocks recovery, while identifiers that are all dead can be
-    // cleared with a compare-and-set so the explicit retryable failure becomes
-    // claimable in this same sweep.
+    // Retryable runs can retain process identifiers from the failed attempt.
+    // Only verified local identities may be checked and cleared on this host.
+    // Due remote retries instead re-enter the existing restart-recovery owner,
+    // which verifies the saved checkpoint, controller lease, and remote target.
     const retryableNativeProcesses = await db
-      .select({ run: heartbeatRuns })
+      .select({ run: heartbeatRuns, nextAttemptAt: nativeRunFinalizations.nextAttemptAt })
       .from(heartbeatRuns)
       .innerJoin(
         nativeRunFinalizations,
@@ -2027,10 +2076,25 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
         ),
       );
     const claimableNativeRunIds = new Set<string>();
-    for (const { run } of retryableNativeProcesses) {
+    const remoteRetryRunIds: string[] = [];
+    for (const { run, nextAttemptAt } of retryableNativeProcesses) {
       if (isNativeRunnerOwnershipHeld(run)) continue;
       if (!run.processPid && !run.processGroupId) {
         claimableNativeRunIds.add(run.id);
+        continue;
+      }
+      if (!await nativeProcessIsLocal(run)) {
+        if (nextAttemptAt && nextAttemptAt > now) continue;
+        if (activeRunExecutions.has(run.id) || runningProcesses.has(run.id)) continue;
+        if (parseObject(run.runnerProfileJson).nativeWorkspaceSync != null) {
+          remoteRetryRunIds.push(run.id);
+        } else {
+          const [taskLease] = await db.select({ id: environmentLeases.id }).from(environmentLeases).where(and(
+            eq(environmentLeases.companyId, run.companyId), eq(environmentLeases.heartbeatRunId, run.id),
+            sql`${environmentLeases.metadata}->>'runnerTaskLease' = 'true'`,
+          )).limit(1);
+          if (taskLease) remoteRetryRunIds.push(run.id);
+        }
         continue;
       }
       const processPidAlive =
@@ -2058,6 +2122,7 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
             and(
               eq(heartbeatRuns.id, run.id),
               eq(heartbeatRuns.runtimeMode, "native"),
+              eq(heartbeatRuns.nextEventSeq, run.nextEventSeq),
               run.processPid === null
                 ? isNull(heartbeatRuns.processPid)
                 : eq(heartbeatRuns.processPid, run.processPid),
@@ -2076,6 +2141,10 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
       });
       if (cleared) claimableNativeRunIds.add(cleared.id);
     }
+
+    const remoteRetryClaims = remoteRetryRunIds.length
+      ? (await recoverNativeRunsAfterRestart(now, remoteRetryRunIds)).claims
+      : [];
 
     const executingRun = (runId: string) => activeRunExecutions.has(runId) || runningProcesses.has(runId);
     if (!settledProcessesDiscovered) {
@@ -2124,7 +2193,7 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
             return [];
           });
     const resumedRunIds = new Set(
-      nativeResumeClaims.map((claim) => claim.runId),
+      [...nativeResumeClaims, ...remoteRetryClaims].map((claim) => claim.runId),
     );
 
     // A terminal issue transition writes this intent in the same transaction
@@ -2276,10 +2345,12 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
       // preserves its explicit physical-copyback hold. Keep its source lease.
       if (nativeWorkspaceFinalizationPending) continue;
       const nativeRun = run.runtimeMode === "native";
+      const nativeLocalProcess = nativeRun && !!(run.processPid || run.processGroupId) &&
+        await nativeProcessIsLocal(run);
       const nativeProcessPidAlive =
-        nativeRun && !!run.processPid && isProcessAlive(run.processPid);
+        nativeLocalProcess && !!run.processPid && isProcessAlive(run.processPid);
       const nativeProcessGroupAlive =
-        nativeRun &&
+        nativeLocalProcess &&
         !!run.processGroupId &&
         isProcessGroupAlive(run.processGroupId);
       const coordinatorOwnedByCurrentController =
@@ -2336,6 +2407,7 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
         });
         continue;
       }
+      if (nativeRun && !locallyTracked && (run.processPid || run.processGroupId) && !nativeLocalProcess) continue;
       if (resumedRunIds.has(run.id)) continue;
       if (locallyTracked) continue;
       if (await hasLiveLegacyController(db, run)) continue;
@@ -2355,7 +2427,7 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
       // for a read-only liveness check so a lost in-memory handle cannot cause
       // overlapping provider/tool execution while that child is still alive.
       const checksPersistedChildLiveness =
-        currentAdapterTracksLocalChild || run.runtimeMode === "native";
+        nativeRun ? nativeLocalProcess : currentAdapterTracksLocalChild;
       const processPidAlive =
         checksPersistedChildLiveness &&
         run.processPid &&
@@ -2600,6 +2672,10 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
   }
 
   return {
+    registerRetainedNativeSessionCleanupWork: retainedNativeCleanup.register,
+    registerNativeWorkspaceFinalizationWork: nativeWorkspaceFinalization.register,
+    registerNativeEnvironmentSettlementWork: nativeEnvironmentSettlement.register,
+    registerScheduledRetryCancellationWork: scheduledRetryCancellation.register,
     sweepPendingCleanupLeases,
     markNativeOwnershipUnverified,
     prepareHotRestartShutdown,
