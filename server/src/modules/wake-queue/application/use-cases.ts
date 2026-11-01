@@ -777,6 +777,8 @@ export type AdmitWakeBehindIssueExecutionInput = {
   requestedByActorType: string | null;
   requestedByActorId: string | null;
   idempotencyKey: string | null;
+  /** The queue service already validated this input as its canonical issue-comment retry identity. */
+  retainCommentReceipt?: boolean;
 };
 
 export type { AdmitWakeBehindIssueExecutionResult };
@@ -923,8 +925,11 @@ export function createAdmitWakeBehindIssueExecution(deps: {
         mergedPayload,
         nextCoalescedCount: (existingDeferred.coalescedCount ?? 0) + 1,
         ...(manualUserWakeActorId ? { manualUserWakeActorId } : {}),
-        ...(input.durableReceipt || (input.requestedByActorType === "user" &&
-            readNonEmptyString(input.requestedByActorId) && readNonEmptyString(input.wakeCommentId))
+        ...(input.durableReceipt ||
+            (input.retainCommentReceipt === true && readNonEmptyString(input.idempotencyKey) &&
+              readNonEmptyString(input.wakeCommentId)) ||
+            (input.requestedByActorType === "user" && readNonEmptyString(input.requestedByActorId) &&
+              readNonEmptyString(input.wakeCommentId))
           ? {
               coalescedReceipt: {
                 ...input.durableReceipt,

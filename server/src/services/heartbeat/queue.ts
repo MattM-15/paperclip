@@ -2954,7 +2954,39 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
               )
               .orderBy(asc(agentWakeupRequests.requestedAt))
               .limit(1);
-            if (existingWake?.runId && existingWake.agentId === agentId) {
+            let replayWake = existingWake;
+            const coalescedIntoWakeupRequestId = readNonEmptyString(
+              existingWake?.payload?.coalescedIntoWakeupRequestId,
+            );
+            if (
+              existingWake &&
+              existingWake.agentId === agentId &&
+              coalescedIntoWakeupRequestId &&
+              isUuidLike(coalescedIntoWakeupRequestId)
+            ) {
+              const [parentWake] = await tx
+                .select()
+                .from(agentWakeupRequests)
+                .where(
+                  and(
+                    eq(agentWakeupRequests.id, coalescedIntoWakeupRequestId),
+                    eq(agentWakeupRequests.companyId, agent.companyId),
+                    eq(agentWakeupRequests.agentId, agentId),
+                    sql`${agentWakeupRequests.payload}->>'issueId' = ${issueId}`,
+                  ),
+                )
+                .limit(1);
+              if (
+                parentWake?.runId &&
+                wakeCommentId &&
+                queuedCommentIdsFromWakePayload(parentWake.payload).includes(
+                  wakeCommentId,
+                )
+              ) {
+                replayWake = parentWake;
+              }
+            }
+            if (replayWake?.runId && replayWake.agentId === agentId) {
               const [existingRun] = await tx
                 .select()
                 .from(heartbeatRuns)
@@ -2962,7 +2994,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
                   and(
                     eq(heartbeatRuns.companyId, agent.companyId),
                     eq(heartbeatRuns.agentId, agentId),
-                    eq(heartbeatRuns.id, existingWake.runId),
+                    eq(heartbeatRuns.id, replayWake.runId),
                   ),
                 )
                 .limit(1);
@@ -4101,21 +4133,40 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
                 wake.payload?.[followUpPayloadKey] === assignmentId &&
                 wake.requestedByActorType === (opts.requestedByActorType ?? null) &&
                 wake.requestedByActorId === (opts.requestedByActorId ?? null));
-              if (pending) await tx.update(agentWakeupRequests).set({
-                payload: withQueuedCommentIdsInWakePayload(pending.payload,
-                  [...new Set([...queuedCommentIdsFromWakePayload(pending.payload), wakeCommentId!])]),
-                coalescedCount: pending.coalescedCount + 1, updatedAt: new Date(),
-              }).where(and(eq(agentWakeupRequests.id, pending.id), eq(agentWakeupRequests.companyId, agent.companyId),
-                eq(agentWakeupRequests.agentId, agentId), eq(agentWakeupRequests.status, "deferred_issue_execution")));
-              else await tx.insert(agentWakeupRequests).values({ companyId: agent.companyId, agentId, source, triggerDetail,
-                reason, payload: withQueuedCommentIdsInWakePayload({ ...payload, issueId: issue.id,
-                  [followUpPayloadKey]: followUp.assignmentId,
-                  [DEFERRED_WAKE_CONTEXT_KEY]: enrichedContextSnapshot }, [wakeCommentId!]),
-                status: followUp.consumed ? "coalesced" : "deferred_issue_execution",
-                runId: followUp.consumed ? activeExecutionRun.id : null,
-                requestedByActorType: opts.requestedByActorType ?? null,
-                requestedByActorId: opts.requestedByActorId ?? null, idempotencyKey: opts.idempotencyKey ?? null,
-                finishedAt: followUp.consumed ? new Date() : null });
+              let carrier = pending;
+              if (pending) {
+                await tx.update(agentWakeupRequests).set({
+                  payload: withQueuedCommentIdsInWakePayload(pending.payload,
+                    [...new Set([...queuedCommentIdsFromWakePayload(pending.payload), wakeCommentId!])]),
+                  coalescedCount: pending.coalescedCount + 1, updatedAt: new Date(),
+                }).where(and(eq(agentWakeupRequests.id, pending.id), eq(agentWakeupRequests.companyId, agent.companyId),
+                  eq(agentWakeupRequests.agentId, agentId), eq(agentWakeupRequests.status, "deferred_issue_execution")));
+              } else {
+                [carrier] = await tx.insert(agentWakeupRequests).values({ companyId: agent.companyId, agentId, source, triggerDetail,
+                  reason, payload: withQueuedCommentIdsInWakePayload({ ...payload, issueId: issue.id,
+                    [followUpPayloadKey]: followUp.assignmentId,
+                    [DEFERRED_WAKE_CONTEXT_KEY]: enrichedContextSnapshot }, [wakeCommentId!]),
+                  status: followUp.consumed ? "coalesced" : "deferred_issue_execution",
+                  runId: followUp.consumed ? activeExecutionRun.id : null,
+                  requestedByActorType: opts.requestedByActorType ?? null,
+                  requestedByActorId: opts.requestedByActorId ?? null,
+                  idempotencyKey: !followUp.consumed && durableIssueCommentWake ? null : opts.idempotencyKey ?? null,
+                  finishedAt: followUp.consumed ? new Date() : null }).returning();
+              }
+              if (!followUp.consumed && durableIssueCommentWake) {
+                if (!carrier) {
+                  throw new Error("comment follow-up carrier was not persisted");
+                }
+                await tx.insert(agentWakeupRequests).values({
+                  companyId: agent.companyId, agentId, source, triggerDetail, reason,
+                  payload: { ...payload, issueId: issue.id, commentId: wakeCommentId!,
+                    coalescedIntoWakeupRequestId: carrier.id },
+                  status: "coalesced", coalescedCount: 1, runId: activeExecutionRun.id,
+                  requestedByActorType: opts.requestedByActorType ?? null,
+                  requestedByActorId: opts.requestedByActorId ?? null,
+                  idempotencyKey: opts.idempotencyKey ?? null, finishedAt: new Date(),
+                });
+              }
               return { kind: "coalesced" as const, run: activeExecutionRun };
             }
 
@@ -4157,6 +4208,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
                 requestedByActorType: opts.requestedByActorType ?? null,
                 requestedByActorId: opts.requestedByActorId ?? null,
                 idempotencyKey: opts.idempotencyKey ?? null,
+                retainCommentReceipt: durableIssueCommentWake,
               },
             );
 
