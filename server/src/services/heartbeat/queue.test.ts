@@ -265,6 +265,30 @@ describe.skipIf(!support.supported)("heartbeat queue database wiring", () => {
     return { company, agent, issue, comment, options, deps, queue: createHeartbeatQueue(db, deps) };
   }
 
+  async function agentCommentWakeFixture() {
+    const [company] = await db.insert(companies).values({ name: "Agent comment wake recovery", issuePrefix: "ACW" }).returning();
+    const [agent] = await db.insert(agents).values({ companyId: company.id, name: "Agent comment target",
+      role: "engineer", status: "idle", adapterType: "process", adapterConfig: {} }).returning();
+    const [author] = await db.insert(agents).values({ companyId: company.id, name: "Agent comment author",
+      role: "engineer", status: "idle", adapterType: "process", adapterConfig: {} }).returning();
+    const [issue] = await db.insert(issues).values({ companyId: company.id, title: "Agent comment task",
+      status: "todo", assigneeAgentId: agent.id, responsibleUserId: "queue-test-user" }).returning();
+    const [comment] = await db.insert(issueComments).values({ companyId: company.id, issueId: issue.id,
+      body: "Please continue", authorAgentId: author.id }).returning();
+    const options = { source: "automation" as const, triggerDetail: "system" as const, reason: "issue_commented",
+      payload: { issueId: issue.id, commentId: comment.id, mutation: "comment" },
+      requestedByActorType: "agent" as const, requestedByActorId: author.id,
+      idempotencyKey: buildIssueCommentWakeIdempotencyKey(comment.id, agent.id),
+      contextSnapshot: { issueId: issue.id, taskId: issue.id, commentId: comment.id,
+        wakeCommentId: comment.id, source: "issue.comment", wakeReason: "issue_commented" } };
+    const deps = callbacks(db);
+    deps.getAgent.mockResolvedValue(agent);
+    deps.instanceSettings.getExperimental.mockResolvedValue({
+      enableIsolatedWorkspaces: false,
+    } as Awaited<ReturnType<HeartbeatQueueDependencies["instanceSettings"]["getExperimental"]>>);
+    return { company, agent, author, issue, comment, options, deps, queue: createHeartbeatQueue(db, deps) };
+  }
+
   it("redispatches a committed queued comment wake on retry", async () => {
     const seeded = await commentWakeFixture();
     seeded.deps.getSchedulingSuppression
@@ -501,6 +525,75 @@ describe.skipIf(!support.supported)("heartbeat queue database wiring", () => {
         status: "skipped",
         reason: "agent.not_invokable",
       }),
+    ]);
+  }, 30_000);
+
+  it.each(["paused", "budget"] as const)(
+    "reuses one skipped diagnostic across concurrent %s retries, then admits after the gate lifts",
+    async (gate) => {
+      const seeded = await agentCommentWakeFixture();
+      if (gate === "paused") {
+        seeded.deps.getAgentInvokability.mockResolvedValue({ invokable: false, reason: "paused",
+          message: "Agent is paused", invalidOrgChain: false, details: {} });
+      } else {
+        seeded.deps.budgets.getInvocationBlock.mockResolvedValue({ scopeType: "agent",
+          scopeId: seeded.agent.id, scopeName: seeded.agent.name,
+          reason: "Agent budget is exhausted" });
+      }
+
+      expect(await Promise.all(Array.from({ length: 6 }, () =>
+        seeded.queue.trackWakeup(seeded.agent.id, seeded.options)))).toEqual(Array(6).fill(null));
+      const refused = await db.select().from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.idempotencyKey, seeded.options.idempotencyKey));
+      expect(refused).toEqual([expect.objectContaining({ status: "skipped", runId: null,
+        reason: gate === "paused" ? "agent.not_invokable" : "budget.blocked", coalescedCount: 5,
+        requestedByActorType: "agent", requestedByActorId: seeded.author.id })]);
+      if (gate === "budget") expect(refused[0]?.payload?.executionWait).toMatchObject({
+        scopeType: "agent", scopeId: seeded.agent.id,
+        requestedIdempotencyKey: seeded.options.idempotencyKey,
+      });
+      expect(await db.select().from(heartbeatRuns)).toHaveLength(0);
+
+      seeded.deps.getAgentInvokability.mockResolvedValue({ invokable: true });
+      seeded.deps.budgets.getInvocationBlock.mockResolvedValue(null);
+      const admitted = await seeded.queue.trackWakeup(seeded.agent.id, seeded.options);
+      expect(admitted).not.toBeNull();
+      const admittedRequest = (await db.select().from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.runId, admitted!.id)))[0]!;
+      if (gate === "paused") seeded.deps.getAgentInvokability.mockResolvedValue({ invokable: false,
+        reason: "paused", message: "Agent is paused", invalidOrgChain: false, details: {} });
+      else seeded.deps.budgets.getInvocationBlock.mockResolvedValue({ scopeType: "agent",
+        scopeId: seeded.agent.id, scopeName: seeded.agent.name,
+        reason: "Agent budget is exhausted" });
+      expect(await Promise.all(Array.from({ length: 3 }, () =>
+        seeded.queue.trackWakeup(seeded.agent.id, seeded.options)))).toEqual(Array(3).fill(null));
+      expect((await db.select().from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.id, admittedRequest.id)))[0]).toEqual(admittedRequest);
+      seeded.deps.getAgentInvokability.mockResolvedValue({ invokable: true });
+      seeded.deps.budgets.getInvocationBlock.mockResolvedValue(null);
+      const replay = await seeded.queue.trackWakeup(seeded.agent.id, seeded.options);
+      expect(replay?.id).toBe(admitted!.id);
+      expect(await db.select().from(heartbeatRuns)).toHaveLength(1);
+      const finalRequests = await db.select().from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.idempotencyKey, seeded.options.idempotencyKey));
+      expect(finalRequests).toHaveLength(2);
+      expect(finalRequests.find(row => row.status === "skipped")?.coalescedCount).toBe(8);
+    },
+    30_000,
+  );
+
+  it("scopes a context-only suppressed comment diagnostic to its issue", async () => {
+    const seeded = await agentCommentWakeFixture();
+    seeded.deps.getSchedulingSuppression.mockResolvedValue({ suppressed: true, reason: "worktree_instance" });
+    const options = { ...seeded.options,
+      payload: { commentId: seeded.comment.id, mutation: "comment" } };
+
+    expect(await Promise.all(Array.from({ length: 6 }, () =>
+      seeded.queue.trackWakeup(seeded.agent.id, options)))).toEqual(Array(6).fill(null));
+    expect(await db.select().from(agentWakeupRequests)).toEqual([
+      expect.objectContaining({ status: "skipped", runId: null,
+        reason: "heartbeat.scheduling_suppressed", coalescedCount: 5,
+        payload: expect.objectContaining({ issueId: seeded.issue.id }) }),
     ]);
   }, 30_000);
 

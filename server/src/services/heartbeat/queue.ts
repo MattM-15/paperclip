@@ -2556,16 +2556,60 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         finishedAt: new Date(),
         ...patch,
       };
-      if (waitCondition && issueId && isUuidLike(issueId)) {
+      if ((waitCondition || durableIssueCommentWake) && issueId && isUuidLike(issueId)) {
         const waitIssueId = issueId;
         return db.transaction(async (tx) => {
           await tx.execute(sql`select id from issues where id = ${waitIssueId} and company_id = ${agent.companyId} for update`);
           if (durableRequest) await notifyChatInboundWakeNotices(tx, {
             companyId: durableRequest.companyId, issueId: durableRequest.issueId,
           });
-          return recordExecutionWait(tx as unknown as Db, {
+          if (durableIssueCommentWake) {
+            const diagnosticPayload = {
+              ...(request.payload ?? {}),
+              issueId: waitIssueId,
+              ...(waitCondition ? { executionWait: {
+                ...waitCondition,
+                requestedIdempotencyKey: request.idempotencyKey ?? null,
+              } } : {}),
+            };
+            const [existing] = await tx.select({ id: agentWakeupRequests.id })
+              .from(agentWakeupRequests)
+              .where(and(
+                eq(agentWakeupRequests.companyId, agent.companyId),
+                eq(agentWakeupRequests.agentId, agentId),
+                eq(agentWakeupRequests.status, "skipped"),
+                isNull(agentWakeupRequests.runId),
+                eq(agentWakeupRequests.idempotencyKey, opts.idempotencyKey!),
+                sql`${agentWakeupRequests.payload}->>'issueId' = ${waitIssueId}`,
+              ))
+              .orderBy(asc(agentWakeupRequests.requestedAt))
+              .limit(1);
+            if (existing) {
+              await tx.update(agentWakeupRequests).set({
+                reason: skipReason,
+                error: request.error ?? null,
+                payload: diagnosticPayload,
+                coalescedCount: sql`${agentWakeupRequests.coalescedCount} + 1`,
+                updatedAt: new Date(),
+              }).where(and(
+                eq(agentWakeupRequests.id, existing.id),
+                eq(agentWakeupRequests.companyId, agent.companyId),
+                eq(agentWakeupRequests.agentId, agentId),
+                eq(agentWakeupRequests.status, "skipped"),
+                isNull(agentWakeupRequests.runId),
+              ));
+              return { created: false };
+            }
+            await tx.insert(agentWakeupRequests).values({
+              ...request,
+              payload: diagnosticPayload,
+            });
+            return { created: true };
+          }
+          if (waitCondition) return recordExecutionWait(tx as unknown as Db, {
             issueId: waitIssueId, request, condition: waitCondition, coalesce: coalesceExecutionWait,
           });
+          return { created: false };
         });
       }
       if (durableRequest) {
